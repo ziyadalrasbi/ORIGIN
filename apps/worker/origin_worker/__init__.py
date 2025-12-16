@@ -1,0 +1,2 @@
+"""ORIGIN Celery Worker."""
+

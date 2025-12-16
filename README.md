@@ -1,0 +1,242 @@
+# ORIGIN - API-First Upload Governance Infrastructure
+
+ORIGIN is an enterprise-grade API-first Upload Governance System for UGC ecosystems (music/video/gaming/etc.). It sits in the decision path at ingest time, returns binding decisions (ALLOW / REVIEW / QUARANTINE / REJECT), and issues signed Decision Certificates with immutable Evidence Packs.
+
+## Architecture
+
+- **API-First**: Functions without a portal; any UI is optional
+- **Deterministic Decisions**: Policy & Decision Engine produces binding decisions; ML outputs are signals only
+- **Tamper-Evident**: Every decision produces a signed, versioned, timestamped Decision Certificate
+- **Evidence Packs**: On-demand PDF/JSON/HTML artifacts via API
+- **Multi-Tenant**: Strict isolation, robust auditing, idempotency, rate limiting
+
+## Quick Start
+
+### Prerequisites
+
+- Docker & Docker Compose
+- Python 3.11+
+- Make (optional, for convenience commands)
+
+### Setup
+
+#### Windows (PowerShell or CMD)
+
+**Option 1: Automated Setup (Recommended)**
+```powershell
+# Run the setup script
+.\setup.ps1
+```
+
+**Option 2: Manual Setup**
+```cmd
+# 1. Copy environment file
+copy env.example .env
+
+# 2. Start services
+docker-compose up -d
+# Or use: up.bat
+
+# 3. Run migrations
+docker-compose exec api alembic upgrade head
+# Or use: migrate.bat
+
+# 4. Seed initial data
+docker-compose exec api python -m origin_api.cli seed
+# Or use: seed.bat
+
+# 5. Verify health
+curl http://localhost:8000/health
+```
+
+#### Linux/Mac
+
+```bash
+# 1. Copy environment file
+cp env.example .env
+
+# 2. Start services
+make up
+# or: docker-compose up -d
+
+# 3. Run migrations
+make migrate
+
+# 4. Seed initial data
+make seed
+
+# 5. Verify health
+curl http://localhost:8000/health
+```
+
+### Test Ingest Endpoint
+
+```bash
+curl -X POST http://localhost:8000/v1/ingest \
+  -H "x-api-key: demo-api-key-12345" \
+  -H "idempotency-key: test-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account_external_id": "user-001",
+    "account_type": "user",
+    "upload_external_id": "upload-001",
+    "metadata": {"title": "Test Upload"},
+    "content_ref": "https://example.com/content.mp3"
+  }'
+```
+
+### Generate Evidence Pack
+
+After an ingest, request an evidence pack:
+
+```bash
+curl -X POST http://localhost:8000/v1/evidence-packs \
+  -H "x-api-key: demo-api-key-12345" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "certificate_id": "<certificate_id_from_ingest>",
+    "format": "json,pdf,html"
+  }'
+```
+
+### Development
+
+#### Windows Commands
+
+```cmd
+# Start all services
+up.bat
+# or: docker-compose up -d
+
+# Run migrations
+migrate.bat
+# or: docker-compose exec api alembic upgrade head
+
+# Seed data
+seed.bat
+# or: docker-compose exec api python -m origin_api.cli seed
+
+# Run tests
+test.bat
+# or: docker-compose exec api pytest tests/ -v
+
+# View logs
+logs.bat
+# or: docker-compose logs -f
+
+# Stop services
+down.bat
+# or: docker-compose down
+```
+
+#### Linux/Mac Commands
+
+```bash
+# Start all services
+make up
+
+# Run migrations
+make migrate
+
+# Seed data
+make seed
+
+# Run tests
+make test
+
+# View logs
+make logs
+
+# Stop services
+make down
+```
+
+## API Documentation
+
+Once running, visit:
+- API Docs: http://localhost:8000/docs
+- Health: http://localhost:8000/health
+- Metrics: http://localhost:8000/metrics
+
+## Project Structure
+
+```
+origin/
+├── apps/
+│   ├── api/              # FastAPI service
+│   └── worker/           # Celery/RQ worker
+├── packages/
+│   ├── sdk-python/       # Python SDK
+│   └── sdk-node/         # Node.js SDK (optional)
+├── data/
+│   ├── seeds/            # Seed data
+│   └── synthetic/        # Synthetic datasets
+├── ml/
+│   ├── training/         # Training scripts
+│   └── datasets/         # ML datasets
+└── infra/
+    ├── migrations/       # Database migrations
+    └── policies/         # Policy definitions
+```
+
+## Architecture Overview
+
+### Core Flow
+
+1. **Ingest** (`POST /v1/ingest`): Content submission with metadata
+2. **Identity Resolution**: KYA++ resolves uploader to persistent identity entities
+3. **Provenance**: PVID generation and prior sighting detection
+4. **ML Signals**: Risk, assurance, anomaly, and synthetic likelihood scores
+5. **Policy Evaluation**: Deterministic decision based on policy rules
+6. **Certificate**: Signed, tamper-evident decision certificate
+7. **Ledger**: Append-only audit trail with hash chaining
+8. **Evidence Pack**: On-demand PDF/JSON/HTML artifacts
+9. **Webhooks**: Async delivery to tenant systems
+
+### Key Components
+
+- **API Service** (`apps/api/`): FastAPI application with all endpoints
+- **Worker** (`apps/worker/`): Celery worker for async tasks (evidence generation)
+- **ML Pipeline** (`ml/`): Training scripts, synthetic data generation, inference
+- **Database**: PostgreSQL with multi-tenant schema
+- **Storage**: MinIO (S3-compatible) for evidence packs
+
+### API Endpoints
+
+#### Public (Tenant) APIs
+- `POST /v1/ingest` - Submit content for decision
+- `POST /v1/evidence-packs` - Request evidence pack generation
+- `GET /v1/evidence-packs/{certificate_id}` - Get evidence pack status
+- `GET /v1/evidence-packs/{certificate_id}/download/{format}` - Download artifact
+- `POST /v1/webhooks` - Create webhook
+- `POST /v1/webhooks/test` - Test webhook delivery
+
+#### Admin APIs
+- `POST /admin/tenants` - Create tenant
+- `POST /admin/tenants/{id}/rotate-api-key` - Rotate API key
+
+### Python SDK
+
+```python
+from origin_sdk import OriginClient
+
+client = OriginClient(api_key="demo-api-key-12345")
+
+# Ingest content
+result = client.ingest(
+    account_external_id="user-001",
+    upload_external_id="upload-001",
+    metadata={"title": "My Upload"},
+)
+
+# Request evidence pack
+evidence = client.request_evidence_pack(
+    certificate_id=result["certificate_id"],
+    format="pdf",
+)
+```
+
+## License
+
+Proprietary - Internal Use Only
+
