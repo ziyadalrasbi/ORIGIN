@@ -12,6 +12,7 @@ from origin_api.middleware.auth import AuthMiddleware
 from origin_api.middleware.correlation import CorrelationIDMiddleware
 from origin_api.middleware.idempotency import IdempotencyMiddleware
 from origin_api.middleware.rate_limit import RateLimitMiddleware
+from origin_api.middleware.scopes import ScopeMiddleware
 from origin_api.routes import admin, evidence, ingest, keys, webhooks
 from origin_api.settings import get_settings
 
@@ -29,6 +30,20 @@ async def lifespan(app: FastAPI):
     """Application lifespan events."""
     logger.info("Starting ORIGIN API...")
     # Startup: Initialize connections, load models, etc.
+    try:
+        # Validate signing configuration
+        from origin_api.ledger.signer import get_signer
+        signer = get_signer()
+        logger.info(f"Signer initialized: {signer.get_key_id()}")
+        
+        # Validate encryption configuration
+        from origin_api.security.encryption import get_encryption_service
+        encryption_service = get_encryption_service()
+        logger.info("Encryption service initialized")
+    except Exception as e:
+        logger.error(f"Configuration validation failed: {e}")
+        raise ValueError(f"Invalid configuration: {e}") from e
+    
     yield
     # Shutdown: Cleanup
     logger.info("Shutting down ORIGIN API...")
@@ -56,6 +71,7 @@ app.add_middleware(
 
 # Custom middleware (order matters - last added is first executed)
 app.add_middleware(AuthMiddleware)  # Extract tenant first
+app.add_middleware(ScopeMiddleware)  # Check scopes after auth
 app.add_middleware(CorrelationIDMiddleware)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(IdempotencyMiddleware)

@@ -63,9 +63,21 @@ def get_tenant_by_api_key(db: Session, api_key: str) -> Optional[Tenant]:
     if api_key_obj:
         # Constant-time comparison of digest
         if api_key_obj.digest and hmac.compare_digest(api_key_obj.digest, digest):
-            # Update last_used_at
-            api_key_obj.last_used_at = datetime.utcnow()
-            db.commit()
+            # Update last_used_at (best-effort, non-blocking)
+            # Use a lightweight update strategy to avoid blocking on every request
+            try:
+                # Only update if last_used_at is None or older than 1 hour
+                should_update = (
+                    api_key_obj.last_used_at is None
+                    or (datetime.utcnow() - api_key_obj.last_used_at).total_seconds() > 3600
+                )
+                if should_update:
+                    api_key_obj.last_used_at = datetime.utcnow()
+                    db.commit()
+            except Exception:
+                # Best-effort: if update fails, continue anyway
+                db.rollback()
+            
             return db.query(Tenant).filter(Tenant.id == api_key_obj.tenant_id).first()
 
     # Legacy fallback (only if feature flag enabled)

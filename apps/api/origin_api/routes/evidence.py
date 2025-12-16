@@ -252,11 +252,22 @@ async def download_evidence_pack(
         "html": "text/html",
     }
 
+    # Include hash metadata in headers for verification
+    headers = {
+        "Content-Disposition": f'attachment; filename="evidence.{format}"',
+    }
+    
+    # Add hash header if available
+    if evidence_pack.artifact_hashes and format in evidence_pack.artifact_hashes:
+        headers["X-Origin-Artifact-Hash"] = evidence_pack.artifact_hashes[format]
+    
+    # Add size header if available
+    if evidence_pack.artifact_sizes and format in evidence_pack.artifact_sizes:
+        headers["X-Origin-Artifact-Size"] = str(evidence_pack.artifact_sizes[format])
+
     return Response(
         content=content,
         media_type=content_types.get(format, "application/octet-stream"),
-        headers={
-            "Content-Disposition": f'attachment; filename="evidence.{format}"',
-        },
+        headers=headers,
     )
 

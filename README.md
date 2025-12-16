@@ -323,26 +323,46 @@ Returns: Binary PDF with appropriate Content-Type headers
 
 ## Webhook Verification
 
-Webhooks are signed with HMAC-SHA256:
+Webhooks are signed with HMAC-SHA256 and include replay protection:
 
 **Headers:**
-- `X-Origin-Signature`: `sha256=<hmac_hex>`
+- `X-Origin-Signature`: `sha256=<hmac_hex>` (signs timestamp + body)
 - `X-Origin-Event`: Event type (e.g., "decision.created")
 - `X-Origin-Correlation-Id`: Request correlation ID
 - `X-Origin-Event-Id`: Delivery attempt ID
+- `X-Origin-Timestamp`: Unix timestamp (replay protection)
 
-**Verification:**
+**Verification (with replay protection):**
 ```python
 import hmac
 import hashlib
+import time
 
-signature = request.headers.get("X-Origin-Signature")
-body = request.body
-secret = "your_webhook_secret"
+signature_header = request.headers.get("X-Origin-Signature")
+timestamp = request.headers.get("X-Origin-Timestamp")
+body = request.body.decode() if isinstance(request.body, bytes) else request.body
+secret = "your_webhook_secret"  # Retrieved from encrypted storage
 
-expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-is_valid = hmac.compare_digest(f"sha256={expected}", signature)
+# Verify timestamp is recent (within 5 minutes)
+if abs(int(time.time()) - int(timestamp)) > 300:
+    raise ValueError("Webhook timestamp too old (replay attack?)")
+
+# Reconstruct signed message: timestamp + "." + body
+message = f"{timestamp}.{body}"
+expected = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+expected_header = f"sha256={expected}"
+
+# Constant-time comparison
+is_valid = hmac.compare_digest(signature_header, expected_header)
+if not is_valid:
+    raise ValueError("Invalid webhook signature")
 ```
+
+**Security Notes:**
+- Webhook secrets are encrypted at rest using AWS KMS (production) or Fernet (local dev)
+- Secrets are never stored in plaintext
+- Timestamp prevents replay attacks (reject if > 5 minutes old)
+- Use constant-time comparison to prevent timing attacks
 
 ## Certificate Verification
 
@@ -353,11 +373,48 @@ GET /v1/keys/jwks.json
 
 Returns JWKS (JSON Web Key Set) with public keys for signature verification.
 
+**Response:**
+```json
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "arn:aws:kms:us-east-1:123456789012:key/abc-123:v1",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "...",
+      "e": "AQAB"
+    }
+  ]
+}
+```
+
 ### Verify Certificate
 1. Get certificate: `GET /v1/certificates/{certificate_id}`
-2. Get public key from JWKS using `key_id`
-3. Verify signature using RSA-PSS with SHA-256
+2. Get public key from JWKS using `certificate.key_id`
+3. Verify signature using RSA-PSS with SHA-256 (or RSASSA_PKCS1_V1_5_SHA_256 for KMS)
 4. Verify ledger hash chain integrity
+
+**Verification Example:**
+```python
+import json
+import base64
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.backends import default_backend
+import jwt
+
+# Get certificate and JWKS
+certificate = requests.get(f"/v1/certificates/{cert_id}").json()
+jwks = requests.get("/v1/keys/jwks.json").json()
+
+# Find matching key
+key_data = next(k for k in jwks["keys"] if k["kid"] == certificate["key_id"])
+
+# Verify signature (simplified - use proper JWT library in production)
+# Certificate data includes: certificate_id, tenant_id, upload_id, policy_version,
+# inputs_hash, outputs_hash, ledger_hash, issued_at, evidence_hashes (if available)
+```
 
 ### Key Rotation
 
@@ -365,6 +422,7 @@ Returns JWKS (JSON Web Key Set) with public keys for signature verification.
 - New certificates use newest key (highest key_id)
 - Old certificates remain verifiable via JWKS
 - Rotate keys by updating `SIGNING_KEY_ID` and restarting
+- KMS key rotation: Create new key version, update `SIGNING_KEY_ID`, restart service
 
 ## Performance
 
@@ -375,11 +433,17 @@ Returns JWKS (JSON Web Key Set) with public keys for signature verification.
 
 ## Security
 
-- **API Keys**: Stored as HMAC-SHA256 digest, never plaintext
+- **API Keys**: Stored as HMAC-SHA256 digest, never plaintext. O(1) indexed lookup.
+- **API Key Scopes**: Enforced per endpoint (ingest, evidence, read)
 - **Tenant Isolation**: All queries enforce tenant_id scoping
 - **IP Allowlists**: Optional per-tenant IP/CIDR restrictions
 - **Structured Logging**: No PII, correlation IDs for tracing
 - **Ledger Integrity**: Hash-chained, tamper-evident audit trail
+- **Webhook Secrets**: Encrypted at rest (AWS KMS or Fernet)
+- **Webhook Replay Protection**: Timestamp-based, rejects old requests
+- **Evidence Pack Integrity**: SHA-256 hashes stored and included in download headers
+- **Certificate Signing**: KMS-ready (AWS KMS or local RSA keypair)
+- **Key Management**: Supports key rotation without breaking old certificates
 
 ## License
 

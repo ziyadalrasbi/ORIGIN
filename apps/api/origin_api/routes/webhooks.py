@@ -21,7 +21,7 @@ class WebhookCreate(BaseModel):
     """Webhook creation request."""
 
     url: str
-    secret: str
+    secret: Optional[str] = None  # Optional: auto-generated if not provided
     events: list[str]  # ["decision.created", "decision.updated", etc.]
 
 
@@ -47,20 +47,20 @@ async def create_webhook(
     tenant: Tenant = request.state.tenant
     correlation_id = getattr(request.state, "correlation_id", None)
 
-    # Hash secret
-    import hashlib
-    secret_hash = hashlib.sha256(webhook_data.secret.encode()).hexdigest()
-
-    webhook = Webhook(
+    # Use WebhookService to create webhook (handles secret generation and encryption)
+    service = WebhookService(db)
+    
+    # Generate secret if not provided
+    from origin_api.security.encryption import get_encryption_service
+    encryption_service = get_encryption_service()
+    secret = webhook_data.secret if webhook_data.secret else encryption_service.generate_secret()
+    
+    webhook = service.create_webhook(
         tenant_id=tenant.id,
         url=webhook_data.url,
-        secret_hash=secret_hash,
+        secret=secret,
         events=webhook_data.events,
-        enabled=True,
     )
-    db.add(webhook)
-    db.commit()
-    db.refresh(webhook)
 
     logger.info(
         "Webhook created",

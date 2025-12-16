@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     signing_key_path: str = "./secrets/origin_signing_key.pem"
     signing_key_id: Optional[str] = None  # For KMS
     signing_key_provider: str = "local"  # local, aws_kms, etc.
+    
+    # AWS (for KMS)
+    aws_region: Optional[str] = None
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    
+    # Webhook encryption
+    webhook_encryption_key_id: Optional[str] = None  # KMS key ID for webhook secret encryption
+    webhook_encryption_provider: str = "local"  # local, aws_kms
 
     # Object storage
     minio_bucket: str = "origin-evidence"

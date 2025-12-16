@@ -21,6 +21,10 @@ from origin_api.provenance.pvid import PVIDGenerator
 from origin_api.services.features import FeatureService
 from origin_api.webhooks.service import WebhookService
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/v1", tags=["ingest"])
 
 

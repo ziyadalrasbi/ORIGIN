@@ -46,7 +46,41 @@ is_valid, error = ledger_service.verify_chain(tenant_id)
 # Returns (True, None) if chain is valid, (False, error_message) if tampered
 ```
 
-### 3. Decision Certificates - KMS-Ready Signing
+### 3. Decision Certificates - KMS-Ready Signing (COMPLETE)
+
+**Changes:**
+- Fully implemented `KmsSigner` using boto3 with AWS KMS
+- Supports `RSASSA_PSS_SHA_256` and `RSASSA_PKCS1_V1_5_SHA_256` signing algorithms
+- Parses DER public keys from KMS into JWK format
+- Configuration validation on startup (fails fast if KMS key missing/inaccessible)
+- Key rotation support: multiple active keys, old certificates remain verifiable
+- `DevLocalSigner` for local development with RSA keypair
+
+**Files:**
+- `apps/api/origin_api/ledger/signer.py` - Complete KMS implementation
+- `apps/api/origin_api/routes/keys.py` - JWKS endpoint
+- `apps/api/origin_api/main.py` - Startup validation
+
+**Environment Variables:**
+```bash
+SIGNING_KEY_PROVIDER=aws_kms  # or "local" for dev
+SIGNING_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/abc-123
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=...  # Optional if using IAM role
+AWS_SECRET_ACCESS_KEY=...  # Optional if using IAM role
+```
+
+**Usage:**
+```python
+from origin_api.ledger.signer import get_signer
+
+signer = get_signer()  # Auto-selects based on SIGNING_KEY_PROVIDER
+signature = signer.sign(data_bytes)
+jwk = signer.get_public_jwk()  # For JWKS endpoint
+```
+
+**Tests:**
+- `apps/api/tests/test_kms_signer.py` - Mocked KMS client tests
 
 **Changes:**
 - Abstract `Signer` interface with `sign()` and `get_public_jwk()` methods
