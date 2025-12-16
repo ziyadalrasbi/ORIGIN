@@ -1,11 +1,17 @@
 """ML inference service for risk signals."""
 
+import hashlib
+import json
 import joblib
+import logging
 import numpy as np
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 class MLInferenceService:
@@ -16,22 +22,66 @@ class MLInferenceService:
         self.model_dir = Path(model_dir)
         self.risk_model = None
         self.anomaly_model = None
+        self.risk_model_version = None
+        self.anomaly_model_version = None
+        self.risk_model_loaded_at = None
+        self.anomaly_model_loaded_at = None
         self._load_models()
 
     def _load_models(self):
-        """Load trained models."""
+        """Load trained models with version tracking."""
         risk_model_path = self.model_dir / "risk_model.pkl"
         anomaly_model_path = self.model_dir / "anomaly_model.pkl"
 
         if risk_model_path.exists():
-            self.risk_model = joblib.load(risk_model_path)
+            try:
+                self.risk_model = joblib.load(risk_model_path)
+                self.risk_model_loaded_at = datetime.utcnow()
+                
+                # Load version from metadata
+                metadata_path = self.model_dir / "risk_model_metadata.json"
+                if metadata_path.exists():
+                    try:
+                        with open(metadata_path, "r") as f:
+                            metadata = json.load(f)
+                            self.risk_model_version = metadata.get("version", "unknown")
+                    except Exception as e:
+                        logger.warning(f"Failed to load risk model metadata: {e}")
+                        self.risk_model_version = "unknown"
+                else:
+                    self.risk_model_version = "unknown"
+                    
+                logger.info(f"Risk model loaded: version={self.risk_model_version}")
+            except Exception as e:
+                logger.error(f"Failed to load risk model: {e}")
+                self.risk_model = None
         else:
-            print("Warning: Risk model not found. Using fallback heuristics.")
+            logger.warning("Risk model not found. Using fallback heuristics.")
 
         if anomaly_model_path.exists():
-            self.anomaly_model = joblib.load(anomaly_model_path)
+            try:
+                self.anomaly_model = joblib.load(anomaly_model_path)
+                self.anomaly_model_loaded_at = datetime.utcnow()
+                
+                # Load version from metadata
+                metadata_path = self.model_dir / "anomaly_model_metadata.json"
+                if metadata_path.exists():
+                    try:
+                        with open(metadata_path, "r") as f:
+                            metadata = json.load(f)
+                            self.anomaly_model_version = metadata.get("version", "unknown")
+                    except Exception as e:
+                        logger.warning(f"Failed to load anomaly model metadata: {e}")
+                        self.anomaly_model_version = "unknown"
+                else:
+                    self.anomaly_model_version = "unknown"
+                    
+                logger.info(f"Anomaly model loaded: version={self.anomaly_model_version}")
+            except Exception as e:
+                logger.error(f"Failed to load anomaly model: {e}")
+                self.anomaly_model = None
         else:
-            print("Warning: Anomaly model not found. Using fallback heuristics.")
+            logger.warning("Anomaly model not found. Using fallback heuristics.")
 
     def compute_risk_signals(
         self,
@@ -67,7 +117,7 @@ class MLInferenceService:
                     probs[3] * 90   # REJECT
                 )
             except Exception as e:
-                print(f"Error in risk model inference: {e}")
+                logger.error(f"Error in risk model inference: {e}")
                 risk_score = self._fallback_risk_score(
                     account_age_days, prior_quarantine_count, identity_confidence
                 )
@@ -94,7 +144,7 @@ class MLInferenceService:
                 # Normalize to 0-100 (lower score = more anomalous)
                 anomaly_score = max(0, min(100, 50 + (anomaly_score_raw * 10)))
             except Exception as e:
-                print(f"Error in anomaly model inference: {e}")
+                logger.error(f"Error in anomaly model inference: {e}")
                 anomaly_score = self._fallback_anomaly_score(upload_velocity, shared_device_count)
         else:
             anomaly_score = self._fallback_anomaly_score(upload_velocity, shared_device_count)
@@ -109,6 +159,10 @@ class MLInferenceService:
             "assurance_score": float(assurance_score),
             "anomaly_score": float(anomaly_score),
             "synthetic_likelihood": float(synthetic_likelihood),
+            "model_versions": {
+                "risk_model": self.risk_model_version or "fallback",
+                "anomaly_model": self.anomaly_model_version or "fallback",
+            },
         }
 
     def _fallback_risk_score(

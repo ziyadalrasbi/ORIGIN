@@ -45,7 +45,7 @@ class APIKey(Base):
     hash = Column(String(255), nullable=True)  # bcrypt hash, legacy only
     
     label = Column(String(255), nullable=True)
-    scopes = Column(Text, nullable=True)  # JSON array of scopes
+    scopes = Column(Text, nullable=True)  # JSON array of scopes (validated on write)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     revoked_at = Column(DateTime, nullable=True)
     last_used_at = Column(DateTime, nullable=True)

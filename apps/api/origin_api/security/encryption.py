@@ -29,6 +29,14 @@ class EncryptionService:
 
     def _initialize(self):
         """Initialize encryption backend."""
+        # Enforce KMS in non-dev environments
+        env = settings.environment.lower()
+        if env not in ("development", "test", "dev") and self.provider == "local":
+            raise ValueError(
+                f"Local encryption provider not allowed in {env} environment. "
+                "Set WEBHOOK_ENCRYPTION_PROVIDER=aws_kms and configure KMS keys."
+            )
+        
         if self.provider == "aws_kms":
             if not settings.webhook_encryption_key_id:
                 raise ValueError("WEBHOOK_ENCRYPTION_KEY_ID required for AWS KMS encryption")
@@ -51,16 +59,29 @@ class EncryptionService:
                     raise ValueError(f"KMS encryption key {settings.webhook_encryption_key_id} not found")
                 raise ValueError(f"Failed to initialize KMS encryption: {e}")
         elif self.provider == "local":
-            # Use Fernet with a key derived from secret_key
+            # Use Fernet with a key derived from secret_key and per-installation salt
+            if not settings.local_encryption_salt:
+                raise ValueError(
+                    "LOCAL_ENCRYPTION_SALT required when WEBHOOK_ENCRYPTION_PROVIDER=local. "
+                    "Generate a random 32-byte salt per installation."
+                )
+            
+            # Decode salt from base64 or use as-is if it's bytes
+            try:
+                salt_bytes = base64.b64decode(settings.local_encryption_salt)
+            except Exception:
+                # If not base64, use as string and encode
+                salt_bytes = settings.local_encryption_salt.encode()[:32].ljust(32, b'\0')
+            
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
-                salt=b"origin_webhook_encryption_salt",
+                salt=salt_bytes,
                 iterations=100000,
             )
             key = base64.urlsafe_b64encode(kdf.derive(settings.secret_key.encode()))
             self._fernet = Fernet(key)
-            logger.info("Local Fernet encryption initialized")
+            logger.info("Local Fernet encryption initialized with per-installation salt")
         else:
             raise ValueError(f"Unknown encryption provider: {self.provider}")
 

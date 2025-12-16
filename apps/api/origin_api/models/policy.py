@@ -21,6 +21,8 @@ class PolicyProfile(Base):
     thresholds_json = Column(JSON, nullable=True)  # Risk thresholds, assurance thresholds, etc.
     weights_json = Column(JSON, nullable=True)  # Feature weights for policy rules
     ruleset_ref = Column(String(255), nullable=True)  # Reference to policy ruleset (OPA bundle or JSON)
+    risk_model_version = Column(String(100), nullable=True)  # ML model version used for risk scoring
+    anomaly_model_version = Column(String(100), nullable=True)  # ML model version used for anomaly detection
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

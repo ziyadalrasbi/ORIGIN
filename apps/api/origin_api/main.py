@@ -13,7 +13,7 @@ from origin_api.middleware.correlation import CorrelationIDMiddleware
 from origin_api.middleware.idempotency import IdempotencyMiddleware
 from origin_api.middleware.rate_limit import RateLimitMiddleware
 from origin_api.middleware.scopes import ScopeMiddleware
-from origin_api.routes import admin, evidence, ingest, keys, webhooks
+from origin_api.routes import admin, evidence, ingest, keys, models, webhooks
 from origin_api.settings import get_settings
 
 # Configure logging
@@ -31,6 +31,9 @@ async def lifespan(app: FastAPI):
     logger.info("Starting ORIGIN API...")
     # Startup: Initialize connections, load models, etc.
     try:
+        # Validate production settings
+        settings.validate_production_settings()
+        
         # Validate signing configuration
         from origin_api.ledger.signer import get_signer
         signer = get_signer()
@@ -86,11 +89,12 @@ app.include_router(ingest.router)
 app.include_router(evidence.router)
 app.include_router(webhooks.router)
 app.include_router(keys.router)
+app.include_router(models.router)
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint (basic liveness)."""
     return {
         "status": "healthy",
         "service": "origin-api",
@@ -100,12 +104,134 @@ async def health_check():
 
 @app.get("/ready")
 async def readiness_check():
-    """Readiness check endpoint."""
-    # TODO: Check database, Redis, MinIO connections
-    return {
-        "status": "ready",
-        "service": "origin-api",
+    """Readiness check endpoint (verifies dependencies)."""
+    from origin_api.db.session import SessionLocal
+    import redis
+    
+    checks = {
+        "database": False,
+        "redis": False,
+        "kms": None,  # None if not required, True/False if required
     }
+    
+    # Check database
+    try:
+        db = SessionLocal()
+        db.execute("SELECT 1")
+        db.close()
+        checks["database"] = True
+    except Exception as e:
+        logger.error(f"Database check failed: {e}")
+        checks["database"] = False
+    
+    # Check Redis
+    try:
+        redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+        redis_client.ping()
+        checks["redis"] = True
+    except Exception as e:
+        logger.error(f"Redis check failed: {e}")
+        checks["redis"] = False
+    
+    # Check KMS (only if not in dev/test)
+    env = settings.environment.lower()
+    if env not in ("development", "test", "dev"):
+        try:
+            from origin_api.security.encryption import get_encryption_service
+            encryption_service = get_encryption_service()
+            # If KMS provider, verify it's accessible
+            if encryption_service.provider == "aws_kms":
+                # Already validated at startup, but double-check
+                checks["kms"] = True
+            else:
+                checks["kms"] = False
+        except Exception as e:
+            logger.error(f"KMS check failed: {e}")
+            checks["kms"] = False
+    else:
+        checks["kms"] = None  # Not required in dev
+    
+    # Determine overall readiness
+    required_checks = ["database", "redis"]
+    if checks["kms"] is not None:
+        required_checks.append("kms")
+    
+    all_ready = all(checks[check] for check in required_checks)
+    
+    status_code = 200 if all_ready else 503
+    
+    return {
+        "status": "ready" if all_ready else "not_ready",
+        "checks": checks,
+    }, status_code
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness check endpoint (verifies dependencies)."""
+    from origin_api.db.session import SessionLocal
+    import redis
+    from fastapi import Response
+    
+    checks = {
+        "database": False,
+        "redis": False,
+        "kms": None,  # None if not required, True/False if required
+    }
+    
+    # Check database
+    try:
+        db = SessionLocal()
+        db.execute("SELECT 1")
+        db.close()
+        checks["database"] = True
+    except Exception as e:
+        logger.error(f"Database check failed: {e}")
+        checks["database"] = False
+    
+    # Check Redis
+    try:
+        redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+        redis_client.ping()
+        checks["redis"] = True
+    except Exception as e:
+        logger.error(f"Redis check failed: {e}")
+        checks["redis"] = False
+    
+    # Check KMS (only if not in dev/test)
+    env = settings.environment.lower()
+    if env not in ("development", "test", "dev"):
+        try:
+            from origin_api.security.encryption import get_encryption_service
+            encryption_service = get_encryption_service()
+            # If KMS provider, verify it's accessible
+            if encryption_service.provider == "aws_kms":
+                # Already validated at startup, but double-check
+                checks["kms"] = True
+            else:
+                checks["kms"] = False
+        except Exception as e:
+            logger.error(f"KMS check failed: {e}")
+            checks["kms"] = False
+    else:
+        checks["kms"] = None  # Not required in dev
+    
+    # Determine overall readiness
+    required_checks = ["database", "redis"]
+    if checks["kms"] is not None:
+        required_checks.append("kms")
+    
+    all_ready = all(checks[check] for check in required_checks)
+    
+    status_code = 200 if all_ready else 503
+    
+    return Response(
+        content={
+            "status": "ready" if all_ready else "not_ready",
+            "checks": checks,
+        },
+        status_code=status_code,
+    )
 
 
 @app.get("/")

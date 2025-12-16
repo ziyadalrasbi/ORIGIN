@@ -29,8 +29,8 @@ class Settings(BaseSettings):
 
     # MinIO / S3
     minio_endpoint: str = "localhost:9000"
-    minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin123"
+    minio_access_key: Optional[str] = None  # Required in non-dev
+    minio_secret_key: Optional[str] = None  # Required in non-dev
     minio_bucket: str = "origin-evidence"
     minio_use_ssl: bool = False
 
@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     # Rate Limiting
     rate_limit_requests_per_minute: int = 100
     rate_limit_burst: int = 20
+    rate_limit_ttl_seconds: int = 600  # TTL for rate limit keys in Redis
 
     # Webhooks
     webhook_timeout_seconds: int = 10
@@ -107,6 +108,27 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Check if running in development."""
         return self.environment.lower() == "development"
+    
+    def validate_production_settings(self):
+        """Validate settings for production environment."""
+        env = self.environment.lower()
+        if env not in ("development", "test", "dev"):
+            # Production settings validation
+            if not self.minio_access_key or not self.minio_secret_key:
+                raise ValueError(
+                    "MINIO_ACCESS_KEY and MINIO_SECRET_KEY are required in production. "
+                    "Do not use default credentials."
+                )
+            if self.webhook_encryption_provider == "local":
+                raise ValueError(
+                    "WEBHOOK_ENCRYPTION_PROVIDER=local is not allowed in production. "
+                    "Use WEBHOOK_ENCRYPTION_PROVIDER=aws_kms."
+                )
+            if self.signing_key_provider == "local":
+                raise ValueError(
+                    "SIGNING_KEY_PROVIDER=local is not allowed in production. "
+                    "Use SIGNING_KEY_PROVIDER=aws_kms."
+                )
 
 
 @lru_cache()

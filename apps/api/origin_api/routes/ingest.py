@@ -222,7 +222,7 @@ async def ingest(
         "reason_codes": decision_result["reason_codes"],
     }
 
-    # Append ledger event
+    # Append ledger event (include model versions for audit)
     ledger_event = ledger_service.append_event(
         tenant_id=tenant.id,
         correlation_id=correlation_id,
@@ -233,6 +233,7 @@ async def ingest(
             "decision": decision_result["decision"],
             "inputs": inputs,
             "outputs": outputs,
+            "model_versions": risk_signals.get("model_versions", {}),
         },
     )
 

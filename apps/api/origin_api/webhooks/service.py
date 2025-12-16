@@ -67,8 +67,9 @@ class WebhookService:
                 if event_type not in (webhook.events or []):
                     continue
 
-                # Enqueue delivery task
-                deliver_webhook.delay(webhook.id, event_type, payload)
+                # Enqueue delivery task with correlation ID
+                correlation_id = payload.get("correlation_id")
+                deliver_webhook.delay(webhook.id, event_type, payload, correlation_id)
         except Exception as e:
             logger.warning(f"Failed to enqueue webhook delivery: {e}", exc_info=True)
 

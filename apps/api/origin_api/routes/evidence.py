@@ -91,7 +91,8 @@ async def request_evidence_pack(
     # Enqueue async generation job
     try:
         from origin_worker.tasks import generate_evidence_pack
-        generate_evidence_pack.delay(certificate.certificate_id, formats)
+        correlation_id = getattr(request.state, "correlation_id", None)
+        generate_evidence_pack.delay(certificate.certificate_id, formats, correlation_id)
     except Exception as e:
         # Fallback to sync if worker unavailable
         logger.warning(f"Worker unavailable, generating synchronously: {e}")

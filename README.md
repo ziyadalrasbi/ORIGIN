@@ -333,6 +333,27 @@ Webhooks are signed with HMAC-SHA256 and include replay protection:
 - `X-Origin-Timestamp`: Unix timestamp (replay protection)
 
 **Verification (with replay protection):**
+
+**Python (using ORIGIN SDK):**
+```python
+from origin_sdk.webhook import verify_webhook
+
+# In FastAPI endpoint
+@app.post("/webhooks/origin")
+async def receive_webhook(request: Request):
+    headers = dict(request.headers)
+    raw_body = await request.body()
+    secret = "your_webhook_secret"  # Retrieved from encrypted storage
+    
+    if verify_webhook(headers, raw_body, secret, tolerance_seconds=300):
+        # Process webhook
+        payload = await request.json()
+        # ... handle webhook
+    else:
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+```
+
+**Manual Verification:**
 ```python
 import hmac
 import hashlib
@@ -356,6 +377,45 @@ expected_header = f"sha256={expected}"
 is_valid = hmac.compare_digest(signature_header, expected_header)
 if not is_valid:
     raise ValueError("Invalid webhook signature")
+```
+
+**Express.js Middleware:**
+```javascript
+const crypto = require('crypto');
+
+function verifyWebhook(req, res, next) {
+  const signature = req.headers['x-origin-signature'];
+  const timestamp = req.headers['x-origin-timestamp'];
+  const secret = process.env.WEBHOOK_SECRET;
+  
+  // Verify timestamp (within 5 minutes)
+  const age = Math.abs(Date.now() / 1000 - parseInt(timestamp));
+  if (age > 300) {
+    return res.status(401).json({ error: 'Timestamp too old' });
+  }
+  
+  // Reconstruct message
+  const body = JSON.stringify(req.body);
+  const message = `${timestamp}.${body}`;
+  
+  // Compute signature
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(message)
+    .digest('hex');
+  
+  const expectedHeader = `sha256=${expected}`;
+  
+  // Constant-time comparison
+  if (!crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedHeader)
+  )) {
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+  
+  next();
+}
 ```
 
 **Security Notes:**
@@ -444,6 +504,82 @@ key_data = next(k for k in jwks["keys"] if k["kid"] == certificate["key_id"])
 - **Evidence Pack Integrity**: SHA-256 hashes stored and included in download headers
 - **Certificate Signing**: KMS-ready (AWS KMS or local RSA keypair)
 - **Key Management**: Supports key rotation without breaking old certificates
+
+## ML Model Training
+
+### Training Pipeline
+
+ORIGIN includes a reproducible ML training pipeline:
+
+```bash
+# Run complete training pipeline
+python -m ml.training.pipeline ml/datasets/synthetic/synthetic_dataset.parquet v1.0.0
+```
+
+The pipeline:
+1. Loads data from parquet file
+2. Engineers features
+3. Trains risk and anomaly models
+4. Evaluates performance
+5. Exports signed artifact metadata (SHA-256 hashes, versions, timestamps)
+
+### Model Metadata
+
+Each trained model includes a metadata JSON file:
+- `risk_model_metadata.json`
+- `anomaly_model_metadata.json`
+
+These files contain:
+- Model version
+- File SHA-256 hash
+- Training timestamp
+- Algorithm metadata
+
+### Model Status Endpoint
+
+```bash
+GET /v1/models/status
+```
+
+Returns:
+- Loaded model versions (risk/anomaly)
+- File hashes
+- Loaded timestamps
+- Policy profiles referencing model versions
+
+### Installing Models
+
+1. Train models using the pipeline
+2. Copy model files to `ml/models/`
+3. Restart API service to load new models
+4. Update policy profiles with `risk_model_version` and `anomaly_model_version`
+
+## Environment Variables
+
+### Required in Production
+
+- `ENVIRONMENT=production` (or staging)
+- `MINIO_ACCESS_KEY` (no defaults allowed)
+- `MINIO_SECRET_KEY` (no defaults allowed)
+- `WEBHOOK_ENCRYPTION_PROVIDER=aws_kms`
+- `WEBHOOK_ENCRYPTION_KEY_ID` (KMS key ID)
+- `SIGNING_KEY_PROVIDER=aws_kms`
+- `SIGNING_KEY_ID` (KMS key ID)
+- `AWS_REGION`
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `LOCAL_ENCRYPTION_SALT` (if using local encryption in dev)
+
+### Development
+
+- `ENVIRONMENT=development` (allows local providers)
+- Default credentials allowed for MinIO
+- Local Fernet encryption with `LOCAL_ENCRYPTION_SALT`
+
+## Health Checks
+
+- `GET /health` - Basic liveness check
+- `GET /ready` - Readiness check (verifies DB, Redis, KMS if required)
 
 ## License
 

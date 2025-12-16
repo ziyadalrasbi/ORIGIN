@@ -12,26 +12,47 @@ from origin_api.models import APIKey
 
 logger = logging.getLogger(__name__)
 
-# Map of path patterns to required scopes
+# Map of path patterns to required scopes (method-specific)
+# Format: (path_pattern, method) -> required_scopes
 SCOPE_MAP = {
-    "/v1/ingest": ["ingest"],
-    "/v1/evidence-packs": ["evidence"],
-    "/v1/evidence-packs/": ["evidence"],  # For paths starting with this
-    "/v1/certificates/": ["read"],
-    "/v1/keys/": ["read"],
-    "/v1/webhooks": ["read"],  # Webhook management requires read
+    # Ingest
+    ("/v1/ingest", "POST"): ["ingest:write"],
+    # Evidence packs
+    ("/v1/evidence-packs", "POST"): ["evidence:write"],
+    ("/v1/evidence-packs", "GET"): ["evidence:read"],
+    # Certificates and keys (all GET methods)
+    ("/v1/certificates", "GET"): ["certificates:read"],
+    ("/v1/keys", "GET"): ["certificates:read"],
+    # Webhooks
+    ("/v1/webhooks", "POST"): ["webhooks:write"],
+    ("/v1/webhooks", "GET"): ["webhooks:read"],
+    ("/v1/webhooks", "PUT"): ["webhooks:write"],
+    ("/v1/webhooks", "DELETE"): ["webhooks:write"],
+    ("/v1/webhooks", "PATCH"): ["webhooks:write"],
+    # Admin endpoints (all methods require admin)
+    ("/admin", "GET"): ["admin"],
+    ("/admin", "POST"): ["admin"],
+    ("/admin", "PUT"): ["admin"],
+    ("/admin", "DELETE"): ["admin"],
+    ("/admin", "PATCH"): ["admin"],
 }
 
 
-def get_required_scope(path: str) -> Optional[list[str]]:
-    """Get required scope for a path."""
-    # Exact match
-    if path in SCOPE_MAP:
-        return SCOPE_MAP[path]
+def get_required_scope(path: str, method: str) -> Optional[list[str]]:
+    """Get required scope for a path and HTTP method."""
+    # Normalize path (remove trailing slashes for matching)
+    normalized_path = path.rstrip("/")
     
-    # Prefix match
-    for pattern, scopes in SCOPE_MAP.items():
-        if path.startswith(pattern):
+    # Try exact match first
+    key = (normalized_path, method)
+    if key in SCOPE_MAP:
+        return SCOPE_MAP[key]
+    
+    # Try prefix match for paths starting with pattern
+    # Sort by pattern length (longest first) for more specific matches
+    sorted_patterns = sorted(SCOPE_MAP.items(), key=lambda x: len(x[0][0]), reverse=True)
+    for (pattern, pattern_method), scopes in sorted_patterns:
+        if normalized_path.startswith(pattern.rstrip("/")) and pattern_method == method:
             return scopes
     
     return None
@@ -46,15 +67,17 @@ class ScopeMiddleware(BaseHTTPMiddleware):
         if request.url.path in ["/health", "/ready", "/metrics", "/docs", "/openapi.json", "/"]:
             return await call_next(request)
 
-        # Skip scope check for admin endpoints
-        if request.url.path.startswith("/admin"):
-            return await call_next(request)
-
-        # Get required scope for this path
-        required_scopes = get_required_scope(request.url.path)
+        # Get required scope for this path and method
+        method = request.method
+        required_scopes = get_required_scope(request.url.path, method)
+        
+        # If no scope requirement, allow (but admin endpoints must have admin scope)
         if not required_scopes:
-            # No scope requirement for this path
-            return await call_next(request)
+            # Admin endpoints always require admin scope
+            if request.url.path.startswith("/admin"):
+                required_scopes = ["admin"]
+            else:
+                return await call_next(request)
 
         # Get API key from header
         api_key = request.headers.get("x-api-key")

@@ -36,7 +36,7 @@ class DatabaseTask(Task):
 
 
 @celery_app.task(base=DatabaseTask, bind=True, max_retries=3)
-def generate_evidence_pack(self, certificate_id: str, formats: list[str]):
+def generate_evidence_pack(self, certificate_id: str, formats: list[str], correlation_id: Optional[str] = None):
     """Generate evidence pack asynchronously."""
     from origin_api.evidence.generator import EvidencePackGenerator
     from origin_api.models import DecisionCertificate, EvidencePack, Upload
@@ -44,6 +44,14 @@ def generate_evidence_pack(self, certificate_id: str, formats: list[str]):
 
     db = self.db
     storage = S3Storage()
+    evidence_pack = None
+    
+    # Structured logging with correlation ID
+    log_extra = {
+        "task": "generate_evidence_pack",
+        "certificate_id": certificate_id,
+        "correlation_id": correlation_id,
+    }
 
     try:
         # Get certificate
@@ -124,10 +132,17 @@ def generate_evidence_pack(self, certificate_id: str, formats: list[str]):
         evidence_pack.generated_at = datetime.utcnow()
         db.commit()
 
-        logger.info(f"Evidence pack generated for certificate {certificate_id}")
+        logger.info(
+            f"Evidence pack generated for certificate {certificate_id}",
+            extra=log_extra,
+        )
 
     except Exception as e:
-        logger.error(f"Error generating evidence pack: {e}", exc_info=True)
+        logger.error(
+            f"Error generating evidence pack: {e}",
+            exc_info=True,
+            extra=log_extra,
+        )
         if evidence_pack:
             evidence_pack.status = "failed"
             db.commit()
@@ -135,7 +150,7 @@ def generate_evidence_pack(self, certificate_id: str, formats: list[str]):
 
 
 @celery_app.task(base=DatabaseTask, bind=True, max_retries=3, autoretry_for=(Exception,), retry_backoff=True, retry_backoff_max=600, retry_jitter=True)
-def deliver_webhook(self, webhook_id: int, event_type: str, payload: dict):
+def deliver_webhook(self, webhook_id: int, event_type: str, payload: dict, correlation_id: Optional[str] = None):
     """Deliver webhook asynchronously with automatic retries."""
     import sys
     sys.path.insert(0, "/app")
@@ -147,16 +162,24 @@ def deliver_webhook(self, webhook_id: int, event_type: str, payload: dict):
     db = self.db
     settings = get_settings()
     delivery = None
+    
+    # Structured logging with correlation ID
+    log_extra = {
+        "task": "deliver_webhook",
+        "webhook_id": webhook_id,
+        "event_type": event_type,
+        "correlation_id": correlation_id,
+    }
 
     try:
         webhook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
         if not webhook:
-            logger.error(f"Webhook {webhook_id} not found")
+            logger.error(f"Webhook {webhook_id} not found", extra=log_extra)
             return
 
         # Check if webhook subscribes to this event
         if event_type not in (webhook.events or []):
-            logger.info(f"Webhook {webhook_id} does not subscribe to {event_type}")
+            logger.info(f"Webhook {webhook_id} does not subscribe to {event_type}", extra=log_extra)
             return
 
         # Get or create delivery record
@@ -196,7 +219,7 @@ def deliver_webhook(self, webhook_id: int, event_type: str, payload: dict):
             raise Exception(f"Webhook delivery failed with status {delivery.response_status}")
 
     except Exception as e:
-        logger.error(f"Error delivering webhook {webhook_id}: {e}", exc_info=True)
+        logger.error(f"Error delivering webhook {webhook_id}: {e}", exc_info=True, extra=log_extra)
         if delivery:
             delivery.status = "failed"
             delivery.response_body = str(e)[:1000]
