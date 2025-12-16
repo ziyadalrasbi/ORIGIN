@@ -29,8 +29,14 @@ class Upload(Base):
     policy_version = Column(String(100), nullable=False)
     risk_score = Column(Numeric(5, 2), nullable=True)  # 0-100
     assurance_score = Column(Numeric(5, 2), nullable=True)  # 0-100
+    decision_inputs_json = Column(JSON, nullable=True)  # Computed features for explainability
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Unique constraint per tenant
+    __table_args__ = (
+        {"sqlite_autoincrement": True},
+    )
 
     # Relationships
     tenant = relationship("Tenant")

@@ -186,12 +186,24 @@ origin/
 1. **Ingest** (`POST /v1/ingest`): Content submission with metadata
 2. **Identity Resolution**: KYA++ resolves uploader to persistent identity entities
 3. **Provenance**: PVID generation and prior sighting detection
-4. **ML Signals**: Risk, assurance, anomaly, and synthetic likelihood scores
-5. **Policy Evaluation**: Deterministic decision based on policy rules
-6. **Certificate**: Signed, tamper-evident decision certificate
-7. **Ledger**: Append-only audit trail with hash chaining
-8. **Evidence Pack**: On-demand PDF/JSON/HTML artifacts
-9. **Webhooks**: Async delivery to tenant systems
+4. **Feature Computation**: Real-time feature extraction from database (account age, velocity, prior decisions)
+5. **ML Signals**: Risk, assurance, anomaly, and synthetic likelihood scores
+6. **Policy Evaluation**: Deterministic decision based on policy rules
+7. **Certificate**: Signed, tamper-evident decision certificate (KMS-ready)
+8. **Ledger**: Append-only audit trail with deterministic hash chaining
+9. **Evidence Pack**: Async generation with S3/MinIO storage
+10. **Webhooks**: Durable background delivery with retries
+
+### Production Features
+
+- **Scalable API Key Auth**: O(1) prefix+digest lookup (no O(n) bcrypt loops)
+- **Deterministic Ledger**: Tenant-sequenced events with verifiable hash chains
+- **KMS-Ready Signing**: Abstract signer interface supporting local dev and AWS KMS
+- **Real Feature Computation**: Database-driven features (no placeholders)
+- **Async Evidence Packs**: Celery tasks with object storage
+- **Durable Webhooks**: Background delivery with HMAC signing and retries
+- **Tenant Isolation**: IP allowlists and strict query scoping
+- **Structured Logging**: Correlation IDs, tenant IDs, structured JSON logs
 
 ### Key Components
 
@@ -205,11 +217,14 @@ origin/
 
 #### Public (Tenant) APIs
 - `POST /v1/ingest` - Submit content for decision
-- `POST /v1/evidence-packs` - Request evidence pack generation
-- `GET /v1/evidence-packs/{certificate_id}` - Get evidence pack status
+- `POST /v1/evidence-packs` - Request evidence pack generation (async)
+- `GET /v1/evidence-packs/{certificate_id}` - Get evidence pack status + signed URLs
 - `GET /v1/evidence-packs/{certificate_id}/download/{format}` - Download artifact
+- `GET /v1/keys/jwks.json` - Get public keys for certificate verification
+- `GET /v1/certificates/{certificate_id}` - Get certificate with verification metadata
 - `POST /v1/webhooks` - Create webhook
 - `POST /v1/webhooks/test` - Test webhook delivery
+- `GET /v1/webhooks/{webhook_id}/deliveries` - View webhook delivery history
 
 #### Admin APIs
 - `POST /admin/tenants` - Create tenant
@@ -235,6 +250,136 @@ evidence = client.request_evidence_pack(
     format="pdf",
 )
 ```
+
+## API Key Authentication
+
+ORIGIN uses scalable prefix+digest authentication:
+
+1. **Format**: API keys are stored with:
+   - `prefix`: First 8 characters (indexed for O(1) lookup)
+   - `digest`: HMAC-SHA256(server_secret, raw_key) (indexed)
+
+2. **Lookup**: 
+   - Extract prefix from raw key
+   - Query `api_keys` where `prefix` matches (indexed lookup)
+   - Constant-time compare `digest` using `hmac.compare_digest()`
+   - Never iterates over all keys (O(1) performance)
+
+3. **Header**: `x-api-key: <your-api-key>`
+
+## Ingest Flow
+
+1. Client sends `POST /v1/ingest` with content metadata
+2. ORIGIN:
+   - Resolves identity (KYA++)
+   - Generates PVID (provenance ID)
+   - Computes features from database (account age, velocity, prior decisions)
+   - Runs ML inference (risk, assurance, anomaly scores)
+   - Evaluates policy (deterministic decision)
+   - Creates signed certificate
+   - Appends ledger event
+   - Enqueues webhook delivery (async)
+3. Returns decision + certificate_id + ledger_hash
+
+**Response Time**: P95 < 3 seconds
+
+## Evidence Pack Request/Download
+
+### Request Evidence Pack
+```bash
+POST /v1/evidence-packs
+{
+  "certificate_id": "abc-123",
+  "format": "json,pdf,html",
+  "audience": "INTERNAL"
+}
+```
+
+Returns: `status: "pending"` (generation is async)
+
+### Get Status + Signed URLs
+```bash
+GET /v1/evidence-packs/{certificate_id}
+```
+
+Returns:
+```json
+{
+  "status": "ready",
+  "formats": ["json", "pdf", "html"],
+  "signed_urls": {
+    "json": "https://minio:9000/evidence/abc-123/evidence.json?X-Amz-Algorithm=...",
+    "pdf": "..."
+  }
+}
+```
+
+### Download Artifact
+```bash
+GET /v1/evidence-packs/{certificate_id}/download/pdf
+```
+
+Returns: Binary PDF with appropriate Content-Type headers
+
+## Webhook Verification
+
+Webhooks are signed with HMAC-SHA256:
+
+**Headers:**
+- `X-Origin-Signature`: `sha256=<hmac_hex>`
+- `X-Origin-Event`: Event type (e.g., "decision.created")
+- `X-Origin-Correlation-Id`: Request correlation ID
+- `X-Origin-Event-Id`: Delivery attempt ID
+
+**Verification:**
+```python
+import hmac
+import hashlib
+
+signature = request.headers.get("X-Origin-Signature")
+body = request.body
+secret = "your_webhook_secret"
+
+expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+is_valid = hmac.compare_digest(f"sha256={expected}", signature)
+```
+
+## Certificate Verification
+
+### Get Public Keys
+```bash
+GET /v1/keys/jwks.json
+```
+
+Returns JWKS (JSON Web Key Set) with public keys for signature verification.
+
+### Verify Certificate
+1. Get certificate: `GET /v1/certificates/{certificate_id}`
+2. Get public key from JWKS using `key_id`
+3. Verify signature using RSA-PSS with SHA-256
+4. Verify ledger hash chain integrity
+
+### Key Rotation
+
+- Multiple active public keys supported
+- New certificates use newest key (highest key_id)
+- Old certificates remain verifiable via JWKS
+- Rotate keys by updating `SIGNING_KEY_ID` and restarting
+
+## Performance
+
+- **Ingest P95**: < 3 seconds
+- **API Key Lookup**: < 10ms (O(1) indexed)
+- **Evidence Generation**: Async, typically < 30s
+- **Webhook Delivery**: Async, < 5s per attempt
+
+## Security
+
+- **API Keys**: Stored as HMAC-SHA256 digest, never plaintext
+- **Tenant Isolation**: All queries enforce tenant_id scoping
+- **IP Allowlists**: Optional per-tenant IP/CIDR restrictions
+- **Structured Logging**: No PII, correlation IDs for tracing
+- **Ledger Integrity**: Hash-chained, tamper-evident audit trail
 
 ## License
 

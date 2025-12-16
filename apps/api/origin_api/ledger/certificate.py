@@ -1,19 +1,18 @@
 """Decision certificate generation and signing."""
 
+import base64
 import hashlib
 import json
 import uuid
 from datetime import datetime
 from typing import Optional
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from sqlalchemy.orm import Session
 
 from origin_api.models import DecisionCertificate, Upload
-from origin_api.settings import get_settings
+from origin_api.ledger.signer import get_signer
 
-settings = get_settings()
+signer = get_signer()
 
 
 class CertificateService:
@@ -22,21 +21,7 @@ class CertificateService:
     def __init__(self, db: Session):
         """Initialize certificate service."""
         self.db = db
-        self._private_key = None
-        self._load_or_generate_key()
-
-    def _load_or_generate_key(self):
-        """Load or generate signing key."""
-        # In production, load from secure storage
-        # For MVP, generate a key (not secure for production!)
-        from cryptography.hazmat.backends import default_backend
-
-        # Generate a key pair (in production, use a proper key management system)
-        self._private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-            backend=default_backend(),
-        )
+        self.signer = get_signer()
 
     def _hash_inputs(self, inputs: dict) -> str:
         """Hash policy inputs."""
@@ -47,20 +32,6 @@ class CertificateService:
         """Hash decision outputs."""
         outputs_str = json.dumps(outputs, sort_keys=True)
         return hashlib.sha256(outputs_str.encode()).hexdigest()
-
-    def _sign(self, data: bytes) -> str:
-        """Sign data with private key."""
-        signature = self._private_key.sign(
-            data,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
-        # Encode as base64 for storage
-        import base64
-        return base64.b64encode(signature).decode()
 
     def generate_certificate(
         self,
@@ -92,7 +63,11 @@ class CertificateService:
 
         # Sign certificate
         certificate_bytes = json.dumps(certificate_data, sort_keys=True).encode()
-        signature = self._sign(certificate_bytes)
+        signature_bytes = self.signer.sign(certificate_bytes)
+        signature = base64.b64encode(signature_bytes).decode()
+
+        # Get key ID
+        key_id = self.signer.get_key_id()
 
         # Create certificate record
         certificate = DecisionCertificate(
@@ -105,10 +80,12 @@ class CertificateService:
             outputs_hash=outputs_hash,
             ledger_hash=ledger_hash,
             signature=signature,
+            key_id=key_id,
+            alg="RS256",
+            signature_encoding="base64",
         )
 
         self.db.add(certificate)
         self.db.flush()
 
         return certificate
-

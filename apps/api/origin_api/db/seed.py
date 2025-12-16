@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
+from origin_api.auth.api_key import compute_key_digest, compute_key_prefix
 from origin_api.models import (
     APIKey,
     Account,
@@ -16,8 +17,8 @@ from origin_api.models import (
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-def hash_api_key(api_key: str) -> str:
-    """Hash an API key using Argon2/bcrypt."""
+def hash_api_key_bcrypt(api_key: str) -> str:
+    """Hash an API key using bcrypt (legacy only)."""
     return pwd_context.hash(api_key)
 
 
@@ -28,16 +29,18 @@ def seed_tenants(db: Session):
     if not demo_tenant:
         demo_tenant = Tenant(
             label="demo",
-            api_key_hash=hash_api_key("demo-api-key-12345"),
+            api_key_hash=None,  # Legacy, deprecated
             status="active",
         )
         db.add(demo_tenant)
         db.flush()
 
-        # Create API key
+        # Create API key with scalable format
         api_key = APIKey(
             tenant_id=demo_tenant.id,
-            hash=hash_api_key("demo-api-key-12345"),
+            prefix=compute_key_prefix("demo-api-key-12345"),
+            digest=compute_key_digest("demo-api-key-12345"),
+            hash=None,  # Legacy, deprecated
             label="Default API Key",
             scopes='["ingest", "evidence", "read"]',
             is_active=True,
@@ -72,7 +75,7 @@ def seed_tenants(db: Session):
     if not test_tenant:
         test_tenant = Tenant(
             label="test",
-            api_key_hash=hash_api_key("test-api-key-67890"),
+            api_key_hash=None,  # Legacy, deprecated
             status="active",
         )
         db.add(test_tenant)
@@ -80,7 +83,9 @@ def seed_tenants(db: Session):
 
         api_key = APIKey(
             tenant_id=test_tenant.id,
-            hash=hash_api_key("test-api-key-67890"),
+            prefix=compute_key_prefix("test-api-key-67890"),
+            digest=compute_key_digest("test-api-key-67890"),
+            hash=None,  # Legacy, deprecated
             label="Test API Key",
             scopes='["ingest", "evidence", "read"]',
             is_active=True,

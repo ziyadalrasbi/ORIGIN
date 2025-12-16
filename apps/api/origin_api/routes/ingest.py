@@ -18,6 +18,7 @@ from origin_api.models import Account, RiskSignal, Upload
 from origin_api.models.tenant import Tenant
 from origin_api.policy.engine import PolicyEngine
 from origin_api.provenance.pvid import PVIDGenerator
+from origin_api.services.features import FeatureService
 from origin_api.webhooks.service import WebhookService
 
 router = APIRouter(prefix="/v1", tags=["ingest"])
@@ -60,12 +61,22 @@ async def ingest(
     """Ingest a content submission and return a decision."""
     # Get tenant from request state (set by auth middleware)
     tenant: Tenant = request.state.tenant
+    correlation_id = getattr(request.state, "correlation_id", str(uuid.uuid4()))
 
     # Generate ingestion ID
     ingestion_id = str(uuid.uuid4())
+    
+    # Structured logging
+    logger.info(
+        "Ingest request received",
+        extra={
+            "tenant_id": tenant.id,
+            "correlation_id": correlation_id,
+            "ingestion_id": ingestion_id,
+            "account_external_id": request_data.account_external_id,
+        },
+    )
 
-    # Get correlation ID from request state
-    correlation_id = getattr(request.state, "correlation_id", str(uuid.uuid4()))
 
     # Get or create account
     account = (
@@ -112,21 +123,24 @@ async def ingest(
         request_data.metadata,
     )
 
+    # Step 4: Compute real features from database
+    feature_service = FeatureService(db)
+    computed_features = feature_service.compute_all_features(
+        tenant_id=tenant.id,
+        account_id=account.id,
+        device_entity_id=identity_result.get("device_entity_id"),
+        pvid=pvid_result["pvid"],
+    )
+
     # Step 7-8: ML Risk Signals
     ml_service = get_inference_service()
-    
-    # Compute account age (simplified - in production, use account.created_at)
-    account_age_days = 30  # Placeholder
-    
-    # Get upload velocity (simplified - in production, query recent uploads)
-    upload_velocity = 1  # Placeholder
 
     risk_signals = ml_service.compute_risk_signals(
-        account_age_days=account_age_days,
+        account_age_days=computed_features["account_age_days"],
         shared_device_count=identity_result["features"]["shared_device_count"],
-        prior_quarantine_count=identity_result["features"]["prior_quarantine_count"],
+        prior_quarantine_count=computed_features["prior_quarantine_count"],
         identity_confidence=identity_result["identity_confidence"],
-        upload_velocity=upload_velocity,
+        upload_velocity=computed_features["upload_velocity_24h"],
         prior_sightings_count=pvid_result["sightings"]["prior_sightings_count"],
     )
 
@@ -138,11 +152,19 @@ async def ingest(
         assurance_score=risk_signals["assurance_score"],
         anomaly_score=risk_signals["anomaly_score"],
         synthetic_likelihood=risk_signals["synthetic_likelihood"],
-        has_prior_quarantine=pvid_result["sightings"]["has_prior_quarantine"],
-        has_prior_reject=pvid_result["sightings"]["has_prior_reject"],
+        has_prior_quarantine=computed_features["has_prior_quarantine"],
+        has_prior_reject=computed_features["has_prior_reject"],
         prior_sightings_count=pvid_result["sightings"]["prior_sightings_count"],
         identity_confidence=identity_result["identity_confidence"],
     )
+
+    # Store computed features for explainability
+    decision_inputs = {
+        **computed_features,
+        "identity_confidence": identity_result["identity_confidence"],
+        "shared_device_count": identity_result["features"]["shared_device_count"],
+        "prior_sightings_count": pvid_result["sightings"]["prior_sightings_count"],
+    }
 
     # Create upload record
     upload = Upload(
@@ -160,6 +182,7 @@ async def ingest(
         policy_version=decision_result["policy_version"],
         risk_score=risk_signals["risk_score"],
         assurance_score=risk_signals["assurance_score"],
+        decision_inputs_json=decision_inputs,
     )
     db.add(upload)
     db.flush()
@@ -221,22 +244,37 @@ async def ingest(
 
     db.commit()
 
-    # Step 12: Webhook delivery (async)
+    # Step 12: Webhook delivery (async via background job)
     try:
-        webhook_service = WebhookService(db)
-        webhook_service.deliver_webhook(
-            tenant.id,
-            "decision.created",
-            {
-                "ingestion_id": ingestion_id,
-                "certificate_id": certificate.certificate_id,
-                "decision": decision_result["decision"],
-                "upload_id": upload.id,
-            },
+        from origin_worker.tasks import deliver_webhook
+        from origin_api.models import Webhook
+        
+        # Find webhooks for this tenant and event
+        webhooks = (
+            db.query(Webhook)
+            .filter(
+                Webhook.tenant_id == tenant.id,
+                Webhook.enabled == True,  # noqa: E712
+            )
+            .all()
         )
+        
+        for webhook in webhooks:
+            if "decision.created" in (webhook.events or []):
+                deliver_webhook.delay(
+                    webhook.id,
+                    "decision.created",
+                    {
+                        "ingestion_id": ingestion_id,
+                        "certificate_id": certificate.certificate_id,
+                        "decision": decision_result["decision"],
+                        "upload_id": upload.id,
+                        "correlation_id": correlation_id,
+                    },
+                )
     except Exception as e:
         # Log but don't fail the request
-        print(f"Webhook delivery failed: {e}")
+        logger.warning(f"Webhook delivery enqueue failed: {e}")
 
     return IngestResponse(
         ingestion_id=ingestion_id,

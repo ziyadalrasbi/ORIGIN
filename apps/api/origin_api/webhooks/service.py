@@ -32,7 +32,8 @@ class WebhookService:
         event_type: str,
         payload: dict,
     ) -> None:
-        """Deliver webhook to all configured endpoints for event type."""
+        """Deliver webhook to all configured endpoints for event type (synchronous)."""
+        # Note: This is now primarily called from background tasks
         webhooks = (
             self.db.query(Webhook)
             .filter(
@@ -62,7 +63,9 @@ class WebhookService:
             try:
                 self._attempt_delivery(webhook, delivery, payload)
             except Exception as e:
-                print(f"Error delivering webhook {webhook.id}: {e}")
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error delivering webhook {webhook.id}: {e}")
                 delivery.status = "failed"
                 delivery.response_body = str(e)
                 self.db.commit()
@@ -74,9 +77,11 @@ class WebhookService:
         # Serialize payload
         payload_bytes = json.dumps(payload).encode()
 
-        # Compute signature (in production, retrieve secret from secure storage)
-        # For MVP, we'll use a placeholder
-        signature = self._compute_signature(payload_bytes, "webhook_secret")
+        # Compute signature using webhook secret
+        # In production, retrieve secret from secure storage (decrypt secret_hash)
+        # For MVP, use a placeholder - TODO: implement secret retrieval
+        webhook_secret = "webhook_secret_placeholder"  # TODO: decrypt from webhook.secret_hash
+        signature = self._compute_signature(payload_bytes, webhook_secret)
 
         # Prepare headers
         headers = {

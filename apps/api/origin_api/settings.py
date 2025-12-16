@@ -61,6 +61,18 @@ class Settings(BaseSettings):
     webhook_timeout_seconds: int = 10
     webhook_max_retries: int = 3
 
+    # Legacy API key fallback (deprecated)
+    legacy_apikey_fallback: bool = False
+
+    # Signing key
+    signing_key_path: str = "./secrets/origin_signing_key.pem"
+    signing_key_id: Optional[str] = None  # For KMS
+    signing_key_provider: str = "local"  # local, aws_kms, etc.
+
+    # Object storage
+    minio_bucket: str = "origin-evidence"
+    evidence_signed_url_ttl: int = 3600  # 1 hour
+
     # CORS
     cors_origins: list[str] = ["*"]
     cors_allow_credentials: bool = True

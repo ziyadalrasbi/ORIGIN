@@ -45,6 +45,9 @@ class DecisionCertificate(Base):
     outputs_hash = Column(String(255), nullable=False)  # Hash of decision outputs
     ledger_hash = Column(String(255), nullable=False, index=True)  # Hash of ledger event
     signature = Column(Text, nullable=False)  # Cryptographic signature
+    key_id = Column(String(100), nullable=True)  # Key ID (kid) for key rotation
+    alg = Column(String(20), default="RS256", nullable=False)  # Signature algorithm
+    signature_encoding = Column(String(20), default="base64", nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships

@@ -12,7 +12,7 @@ from origin_api.middleware.auth import AuthMiddleware
 from origin_api.middleware.correlation import CorrelationIDMiddleware
 from origin_api.middleware.idempotency import IdempotencyMiddleware
 from origin_api.middleware.rate_limit import RateLimitMiddleware
-from origin_api.routes import admin, evidence, ingest, webhooks
+from origin_api.routes import admin, evidence, ingest, keys, webhooks
 from origin_api.settings import get_settings
 
 # Configure logging
@@ -69,6 +69,7 @@ app.include_router(admin.router)
 app.include_router(ingest.router)
 app.include_router(evidence.router)
 app.include_router(webhooks.router)
+app.include_router(keys.router)
 
 
 @app.get("/health")
