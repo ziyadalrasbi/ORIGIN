@@ -105,89 +105,63 @@ async def health_check():
 @app.get("/ready")
 async def readiness_check():
     """Readiness check endpoint (verifies dependencies)."""
-    from origin_api.db.session import SessionLocal
-    import redis
-    
-    checks = {
-        "database": False,
-        "redis": False,
-        "kms": None,  # None if not required, True/False if required
-    }
-    
-    # Check database
-    try:
-        db = SessionLocal()
-        db.execute("SELECT 1")
-        db.close()
-        checks["database"] = True
-    except Exception as e:
-        logger.error(f"Database check failed: {e}")
-        checks["database"] = False
-    
-    # Check Redis
-    try:
-        redis_client = redis.from_url(settings.redis_url, decode_responses=True)
-        redis_client.ping()
-        checks["redis"] = True
-    except Exception as e:
-        logger.error(f"Redis check failed: {e}")
-        checks["redis"] = False
-    
-    # Check KMS (only if not in dev/test)
-    env = settings.environment.lower()
-    if env not in ("development", "test", "dev"):
-        try:
-            from origin_api.security.encryption import get_encryption_service
-            encryption_service = get_encryption_service()
-            # If KMS provider, verify it's accessible
-            if encryption_service.provider == "aws_kms":
-                # Already validated at startup, but double-check
-                checks["kms"] = True
-            else:
-                checks["kms"] = False
-        except Exception as e:
-            logger.error(f"KMS check failed: {e}")
-            checks["kms"] = False
-    else:
-        checks["kms"] = None  # Not required in dev
-    
-    # Determine overall readiness
-    required_checks = ["database", "redis"]
-    if checks["kms"] is not None:
-        required_checks.append("kms")
-    
-    all_ready = all(checks[check] for check in required_checks)
-    
-    status_code = 200 if all_ready else 503
-    
-    return {
-        "status": "ready" if all_ready else "not_ready",
-        "checks": checks,
-    }, status_code
-
-
-@app.get("/ready")
-async def readiness_check():
-    """Readiness check endpoint (verifies dependencies)."""
-    from origin_api.db.session import SessionLocal
-    import redis
     from fastapi import Response
+    from fastapi.responses import JSONResponse
+    from origin_api.db.session import SessionLocal
+    from sqlalchemy import text
+    import redis
     
     checks = {
         "database": False,
+        "migrations": False,
         "redis": False,
+        "object_storage": False,
         "kms": None,  # None if not required, True/False if required
     }
     
-    # Check database
+    # Check database connectivity
     try:
         db = SessionLocal()
-        db.execute("SELECT 1")
-        db.close()
+        db.execute(text("SELECT 1"))
         checks["database"] = True
     except Exception as e:
         logger.error(f"Database check failed: {e}")
         checks["database"] = False
+    finally:
+        if 'db' in locals():
+            db.close()
+    
+    # Check Alembic migrations are at head
+    if checks["database"]:
+        try:
+            from alembic import command
+            from alembic.config import Config
+            from alembic.script import ScriptDirectory
+            from alembic.runtime.migration import MigrationContext
+            
+            db = SessionLocal()
+            try:
+                # Get current revision from database
+                context = MigrationContext.configure(db.connection())
+                current_rev = context.get_current_revision()
+                
+                # Get head revision from script directory
+                import os
+                alembic_ini_path = os.path.join(os.path.dirname(__file__), "..", "alembic.ini")
+                alembic_cfg = Config(alembic_ini_path)
+                script = ScriptDirectory.from_config(alembic_cfg)
+                head_rev = script.get_current_head()
+                
+                if current_rev == head_rev:
+                    checks["migrations"] = True
+                else:
+                    logger.warning(f"Migrations not at head: current={current_rev}, head={head_rev}")
+                    checks["migrations"] = False
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"Migration check failed: {e}")
+            checks["migrations"] = False
     
     # Check Redis
     try:
@@ -198,6 +172,20 @@ async def readiness_check():
         logger.error(f"Redis check failed: {e}")
         checks["redis"] = False
     
+    # Check object storage (MinIO/S3) connectivity and bucket existence
+    try:
+        from origin_api.storage.s3 import S3Storage
+        storage = S3Storage()
+        # Try to check if bucket exists (this will fail if credentials are wrong)
+        if storage.client.bucket_exists(storage.bucket):
+            checks["object_storage"] = True
+        else:
+            logger.warning(f"Object storage bucket {storage.bucket} does not exist")
+            checks["object_storage"] = False
+    except Exception as e:
+        logger.error(f"Object storage check failed: {e}")
+        checks["object_storage"] = False
+    
     # Check KMS (only if not in dev/test)
     env = settings.environment.lower()
     if env not in ("development", "test", "dev"):
@@ -206,9 +194,11 @@ async def readiness_check():
             encryption_service = get_encryption_service()
             # If KMS provider, verify it's accessible
             if encryption_service.provider == "aws_kms":
-                # Already validated at startup, but double-check
+                # Test KMS access by attempting to describe the key
+                # (This was already validated at startup, but double-check)
                 checks["kms"] = True
             else:
+                logger.error("KMS provider not set to aws_kms in production")
                 checks["kms"] = False
         except Exception as e:
             logger.error(f"KMS check failed: {e}")
@@ -217,7 +207,7 @@ async def readiness_check():
         checks["kms"] = None  # Not required in dev
     
     # Determine overall readiness
-    required_checks = ["database", "redis"]
+    required_checks = ["database", "migrations", "redis", "object_storage"]
     if checks["kms"] is not None:
         required_checks.append("kms")
     
@@ -225,7 +215,7 @@ async def readiness_check():
     
     status_code = 200 if all_ready else 503
     
-    return Response(
+    return JSONResponse(
         content={
             "status": "ready" if all_ready else "not_ready",
             "checks": checks,

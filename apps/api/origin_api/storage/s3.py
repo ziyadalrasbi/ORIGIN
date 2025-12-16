@@ -32,7 +32,7 @@ class S3Storage:
             if not self.client.bucket_exists(self.bucket):
                 self.client.make_bucket(self.bucket)
         except S3Error as e:
-            print(f"Error ensuring bucket exists: {e}")
+            logger.error(f"Error ensuring bucket exists: {e}")
 
     def upload_object(
         self, object_key: str, data: bytes, content_type: str = "application/octet-stream"
@@ -71,7 +71,7 @@ class S3Storage:
             )
             return url
         except S3Error as e:
-            print(f"Error generating signed URL: {e}")
+            logger.error(f"Error generating signed URL: {e}")
             raise
 
     def get_object(self, object_key: str) -> bytes:
@@ -83,6 +83,6 @@ class S3Storage:
             response.release_conn()
             return data
         except S3Error as e:
-            print(f"Error getting object: {e}")
+            logger.error(f"Error getting object: {e}")
             raise
 

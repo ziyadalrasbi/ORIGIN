@@ -48,41 +48,42 @@ def test_encrypt_decrypt_webhook_secret(encryption_service):
 
 
 def test_webhook_signature_with_replay_protection():
-    """Test webhook signature includes timestamp for replay protection."""
+    """Test webhook signature includes timestamp for replay protection (raw bytes)."""
     secret = "test-secret"
     payload = {"event": "test", "data": "value"}
-    payload_bytes = json.dumps(payload, sort_keys=True).encode()
+    payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
     timestamp = "1234567890"
     
-    # Compute signature
-    message = f"{timestamp}.{payload_bytes.decode()}"
-    signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+    # Compute signature using raw bytes (timestamp_bytes + b"." + raw_body_bytes)
+    message = timestamp.encode("utf-8") + b"." + payload_bytes
+    signature = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
     
     # Verify signature changes if timestamp changes
     timestamp2 = "1234567891"
-    message2 = f"{timestamp2}.{payload_bytes.decode()}"
-    signature2 = hmac.new(secret.encode(), message2.encode(), hashlib.sha256).hexdigest()
+    message2 = timestamp2.encode("utf-8") + b"." + payload_bytes
+    signature2 = hmac.new(secret.encode("utf-8"), message2, hashlib.sha256).hexdigest()
     
     assert signature != signature2, "Signature should change with timestamp"
     
     # Verify signature changes if payload changes
     payload2 = {"event": "test", "data": "different"}
-    payload_bytes2 = json.dumps(payload2, sort_keys=True).encode()
-    message3 = f"{timestamp}.{payload_bytes2.decode()}"
-    signature3 = hmac.new(secret.encode(), message3.encode(), hashlib.sha256).hexdigest()
+    payload_bytes2 = json.dumps(payload2, sort_keys=True).encode("utf-8")
+    message3 = timestamp.encode("utf-8") + b"." + payload_bytes2
+    signature3 = hmac.new(secret.encode("utf-8"), message3, hashlib.sha256).hexdigest()
     
     assert signature != signature3, "Signature should change with payload"
 
 
 def test_webhook_signature_constant_time_compare():
-    """Test webhook signature uses constant-time comparison."""
+    """Test webhook signature uses constant-time comparison (raw bytes)."""
     secret = "test-secret"
     payload = {"event": "test"}
-    payload_bytes = json.dumps(payload, sort_keys=True).encode()
+    payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
     timestamp = "1234567890"
     
-    message = f"{timestamp}.{payload_bytes.decode()}"
-    expected = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+    # Compute signature using raw bytes
+    message = timestamp.encode("utf-8") + b"." + payload_bytes
+    expected = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
     
     # Use constant-time compare
     signature = f"sha256={expected}"
