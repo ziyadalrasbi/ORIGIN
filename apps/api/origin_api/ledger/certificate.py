@@ -86,7 +86,7 @@ class CertificateService:
             ledger_hash=ledger_hash,
             signature=signature,
             key_id=key_id,
-            alg="RS256",
+            alg=self.signer.get_public_jwk().get("alg", "PS256"),  # Use algorithm from signer JWK
             signature_encoding="base64",
         )
 

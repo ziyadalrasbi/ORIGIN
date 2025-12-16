@@ -36,10 +36,13 @@ class WebhookService:
         return self.encryption_service.decrypt(ciphertext_data)
 
     def _compute_signature(self, payload: bytes, secret: str, timestamp: str) -> str:
-        """Compute HMAC signature for webhook payload with replay protection."""
-        # Sign: timestamp + "." + body
-        message = f"{timestamp}.{payload.decode()}"
-        return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+        """Compute HMAC signature for webhook payload with replay protection.
+        
+        Signs: timestamp + "." + raw_body_bytes (exactly as delivered, not re-serialized).
+        """
+        # Sign: timestamp + "." + raw_body_bytes (preserve exact bytes)
+        message = timestamp.encode() + b"." + payload
+        return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
     def deliver_webhook(
         self,
@@ -87,13 +90,14 @@ class WebhookService:
             self.db.commit()
             return
 
-        # Serialize payload deterministically
-        payload_bytes = json.dumps(payload, sort_keys=True).encode()
+        # Serialize payload to raw bytes (this is what will be sent in HTTP body)
+        # Use sort_keys=True for deterministic ordering, but preserve exact bytes
+        payload_bytes = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
 
         # Generate timestamp for replay protection
         timestamp = str(int(datetime.utcnow().timestamp()))
 
-        # Compute signature with replay protection
+        # Compute signature with replay protection (signs timestamp + "." + raw_body_bytes)
         signature = self._compute_signature(payload_bytes, secret, timestamp)
 
         # Get correlation_id and event_id from payload
@@ -111,9 +115,10 @@ class WebhookService:
         }
 
         # Make request
+        # CRITICAL: Send raw body bytes (not re-serialized JSON) to match signature
         try:
             with httpx.Client(timeout=settings.webhook_timeout_seconds) as client:
-                response = client.post(webhook.url, json=payload, headers=headers)
+                response = client.post(webhook.url, content=payload_bytes, headers=headers)
 
                 delivery.response_status = response.status_code
                 delivery.response_body = response.text[:1000]  # Truncate

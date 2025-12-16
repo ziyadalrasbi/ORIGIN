@@ -48,14 +48,17 @@ def verify_webhook(
     except (ValueError, TypeError):
         return False  # Invalid timestamp format
     
-    # Reconstruct signed message: timestamp + "." + body
-    body_str = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else raw_body
-    message = f"{timestamp_str}.{body_str}"
+    # Reconstruct signed message: timestamp + "." + raw_body_bytes
+    # Use raw bytes exactly as received (not re-encoded)
+    if not isinstance(raw_body, bytes):
+        raw_body = raw_body.encode("utf-8")
+    
+    message = timestamp_str.encode("utf-8") + b"." + raw_body
     
     # Compute expected signature
     computed_signature = hmac.new(
-        secret.encode(),
-        message.encode(),
+        secret.encode("utf-8"),
+        message,
         hashlib.sha256,
     ).hexdigest()
     

@@ -106,7 +106,7 @@ class DevLocalSigner(Signer):
             "kty": "RSA",
             "kid": self._key_id,
             "use": "sig",
-            "alg": "RS256",
+            "alg": "PS256",  # RSA-PSS SHA-256 (matches actual signing algorithm)
             "n": int_to_base64url(n),
             "e": int_to_base64url(e),
         }
@@ -223,7 +223,7 @@ class KmsSigner(Signer):
                 "kty": "RSA",
                 "kid": kid,
                 "use": "sig",
-                "alg": "RS256",
+                "alg": "PS256",  # RSA-PSS SHA-256 (matches actual signing algorithm RSASSA_PSS_SHA_256)
                 "n": int_to_base64url(n),
                 "e": int_to_base64url(e),
             }

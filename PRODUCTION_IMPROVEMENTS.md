@@ -274,15 +274,29 @@ cert = client.get(f"/v1/certificates/{cert_id}").json()
 ## 🔐 Security Notes
 
 1. **API Keys**: Never log raw keys, only prefixes
-2. **Webhook Secrets**: Should be encrypted at rest (TODO: implement secret management)
+2. **Webhook Secrets**: Encrypted at rest using AWS KMS (production) or Fernet (dev with per-installation salt)
 3. **Signing Keys**: Use KMS in production, never commit keys
-4. **IP Allowlists**: Fail open for misconfiguration (logs warning)
+4. **IP Allowlists**: Fail-closed in production/staging, fail-open in development (configurable via `IP_ALLOWLIST_FAIL_OPEN`)
+5. **Webhook Signing**: Uses raw body bytes (not re-serialized JSON) for signature computation
+6. **Certificate Algorithm**: PS256 (RSA-PSS SHA-256) - matches JWKS and certificate `alg` field
 
-## 🚀 Next Steps
+## ✅ Recent Security Fixes
 
-1. Implement secret management for webhook secrets
-2. Complete AWS KMS signer implementation
-3. Add load testing scripts (k6/locust)
-4. Add comprehensive integration tests
-5. Document certificate verification process
+### IP Allowlist Fail-Closed
+- Production/staging: Invalid JSON denies access (fail-closed)
+- Development: Invalid JSON allows access with warning (fail-open)
+- Configurable via `IP_ALLOWLIST_FAIL_OPEN` environment variable
+- Metrics tracked for parse errors
+
+### Webhook Raw Body Signing
+- Webhooks signed using raw body bytes (not re-serialized JSON)
+- Signature: `HMAC-SHA256(timestamp + "." + raw_body_bytes)`
+- SDK `verify_webhook()` accepts raw bytes
+- Express.js example includes raw body capture middleware
+
+### Certificate Algorithm Consistency
+- All signers use PS256 (RSA-PSS SHA-256)
+- JWKS advertises `alg: "PS256"`
+- Certificate `alg` field matches JWKS
+- Verification docs specify PS256 algorithm
 

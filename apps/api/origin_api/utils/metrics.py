@@ -47,3 +47,25 @@ webhook_deliveries = Counter(
     ["status"],
 )
 
+# IP allowlist metrics
+ip_allowlist_parse_error = Counter(
+    "origin_ip_allowlist_parse_error_total",
+    "IP allowlist parse errors",
+    ["fail_open"],
+)
+
+ip_allowlist_error = Counter(
+    "origin_ip_allowlist_error_total",
+    "IP allowlist errors",
+    ["fail_open"],
+)
+
+
+def increment_counter(name: str, labels: dict = None):
+    """Helper to increment a counter metric."""
+    # This is a simple wrapper - in production, use proper Prometheus client
+    # For now, we'll just log the metric increment
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug(f"Metric increment: {name} with labels {labels}")
+

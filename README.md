@@ -353,7 +353,7 @@ async def receive_webhook(request: Request):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 ```
 
-**Manual Verification:**
+**Manual Verification (CRITICAL: Use raw body bytes):**
 ```python
 import hmac
 import hashlib
@@ -361,16 +361,19 @@ import time
 
 signature_header = request.headers.get("X-Origin-Signature")
 timestamp = request.headers.get("X-Origin-Timestamp")
-body = request.body.decode() if isinstance(request.body, bytes) else request.body
+# CRITICAL: Use raw body bytes, not re-serialized JSON
+raw_body = await request.body()  # FastAPI: await request.body()
+# OR: raw_body = request.get_data()  # Flask
 secret = "your_webhook_secret"  # Retrieved from encrypted storage
 
 # Verify timestamp is recent (within 5 minutes)
 if abs(int(time.time()) - int(timestamp)) > 300:
     raise ValueError("Webhook timestamp too old (replay attack?)")
 
-# Reconstruct signed message: timestamp + "." + body
-message = f"{timestamp}.{body}"
-expected = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+# Reconstruct signed message: timestamp + "." + raw_body_bytes
+# Use raw bytes exactly as received, not re-encoded
+message = timestamp.encode("utf-8") + b"." + raw_body
+expected = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 expected_header = f"sha256={expected}"
 
 # Constant-time comparison
@@ -379,9 +382,22 @@ if not is_valid:
     raise ValueError("Invalid webhook signature")
 ```
 
-**Express.js Middleware:**
+**Express.js Middleware (CRITICAL: Capture raw body before JSON parsing):**
 ```javascript
 const crypto = require('crypto');
+
+// IMPORTANT: Use body-parser with verify to capture raw body
+const express = require('express');
+const bodyParser = require('body-parser');
+
+const app = express();
+
+// Capture raw body before JSON parsing
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;  // Store raw body bytes
+  }
+}));
 
 function verifyWebhook(req, res, next) {
   const signature = req.headers['x-origin-signature'];
@@ -394,9 +410,13 @@ function verifyWebhook(req, res, next) {
     return res.status(401).json({ error: 'Timestamp too old' });
   }
   
-  // Reconstruct message
-  const body = JSON.stringify(req.body);
-  const message = `${timestamp}.${body}`;
+  // CRITICAL: Use raw body bytes, not JSON.stringify(req.body)
+  const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+  const message = Buffer.concat([
+    Buffer.from(timestamp),
+    Buffer.from('.'),
+    rawBody
+  ]);
   
   // Compute signature
   const expected = crypto
@@ -441,7 +461,7 @@ Returns JWKS (JSON Web Key Set) with public keys for signature verification.
       "kty": "RSA",
       "kid": "arn:aws:kms:us-east-1:123456789012:key/abc-123:v1",
       "use": "sig",
-      "alg": "RS256",
+      "alg": "PS256",
       "n": "...",
       "e": "AQAB"
     }
@@ -452,28 +472,72 @@ Returns JWKS (JSON Web Key Set) with public keys for signature verification.
 ### Verify Certificate
 1. Get certificate: `GET /v1/certificates/{certificate_id}`
 2. Get public key from JWKS using `certificate.key_id`
-3. Verify signature using RSA-PSS with SHA-256 (or RSASSA_PKCS1_V1_5_SHA_256 for KMS)
+3. Verify signature using the algorithm specified in `certificate.alg`:
+   - **PS256** (RSA-PSS SHA-256) - Default for all signers
+   - Use the `alg` field from the certificate, not hardcoded
 4. Verify ledger hash chain integrity
 
-**Verification Example:**
+**Algorithm Details:**
+- ORIGIN uses **PS256** (RSA-PSS SHA-256) for all certificate signing
+- JWKS advertises `alg: "PS256"` in the public key
+- Certificate `alg` field matches JWKS `alg` field
+- Do not use RS256 (PKCS1) - ORIGIN does not use this algorithm
+
+**Verification Example (PS256):**
 ```python
 import json
 import base64
+import requests
+from jwcrypto import jwk
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
-import jwt
 
-# Get certificate and JWKS
-certificate = requests.get(f"/v1/certificates/{cert_id}").json()
-jwks = requests.get("/v1/keys/jwks.json").json()
+# 1. Get certificate
+certificate = requests.get(f"{base_url}/v1/certificates/{cert_id}").json()
 
-# Find matching key
-key_data = next(k for k in jwks["keys"] if k["kid"] == certificate["key_id"])
+# 2. Get JWKS
+jwks_response = requests.get(f"{base_url}/v1/keys/jwks.json").json()
+jwk_dict = next(k for k in jwks_response["keys"] if k["kid"] == certificate["key_id"])
 
-# Verify signature (simplified - use proper JWT library in production)
-# Certificate data includes: certificate_id, tenant_id, upload_id, policy_version,
-# inputs_hash, outputs_hash, ledger_hash, issued_at, evidence_hashes (if available)
+# 3. Verify algorithm matches (must be PS256)
+assert jwk_dict["alg"] == certificate["alg"] == "PS256"
+
+# 4. Load public key from JWK
+jwk_key = jwk.JWK(**jwk_dict)
+public_key_pem = jwk_key.export_to_pem()
+public_key = serialization.load_pem_public_key(
+    public_key_pem, backend=default_backend()
+)
+
+# 5. Reconstruct certificate data (same as what was signed)
+certificate_data = {
+    "certificate_id": certificate["certificate_id"],
+    "tenant_id": certificate.get("tenant_id"),
+    "upload_id": certificate.get("upload_id"),
+    "policy_version": certificate["policy_version"],
+    "inputs_hash": certificate["inputs_hash"],
+    "outputs_hash": certificate["outputs_hash"],
+    "ledger_hash": certificate["ledger_hash"],
+    "issued_at": certificate["issued_at"],
+}
+certificate_bytes = json.dumps(certificate_data, sort_keys=True).encode()
+
+# 6. Verify signature using PS256 (RSA-PSS SHA-256)
+signature_bytes = base64.b64decode(certificate["signature"])
+public_key.verify(
+    signature_bytes,
+    certificate_bytes,
+    padding.PSS(
+        mgf=padding.MGF1(hashes.SHA256()),
+        salt_length=padding.PSS.MAX_LENGTH,
+    ),
+    hashes.SHA256(),
+)
+# If no exception, signature is valid
+
+# 7. Verify ledger hash chain (optional but recommended)
+# Use ledger verification endpoint or verify locally
 ```
 
 ### Key Rotation
@@ -496,7 +560,7 @@ key_data = next(k for k in jwks["keys"] if k["kid"] == certificate["key_id"])
 - **API Keys**: Stored as HMAC-SHA256 digest, never plaintext. O(1) indexed lookup.
 - **API Key Scopes**: Enforced per endpoint (ingest, evidence, read)
 - **Tenant Isolation**: All queries enforce tenant_id scoping
-- **IP Allowlists**: Optional per-tenant IP/CIDR restrictions
+- **IP Allowlists**: Optional per-tenant IP/CIDR restrictions (fail-closed in production)
 - **Structured Logging**: No PII, correlation IDs for tracing
 - **Ledger Integrity**: Hash-chained, tamper-evident audit trail
 - **Webhook Secrets**: Encrypted at rest (AWS KMS or Fernet)

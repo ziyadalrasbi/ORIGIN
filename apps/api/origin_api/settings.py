@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     rate_limit_requests_per_minute: int = 100
     rate_limit_burst: int = 20
     rate_limit_ttl_seconds: int = 600  # TTL for rate limit keys in Redis
+    
+    # IP Allowlist
+    ip_allowlist_fail_open: Optional[bool] = None  # None = auto-detect based on environment
 
     # Webhooks
     webhook_timeout_seconds: int = 10
@@ -108,6 +111,14 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Check if running in development."""
         return self.environment.lower() == "development"
+    
+    @property
+    def ip_allowlist_should_fail_open(self) -> bool:
+        """Determine if IP allowlist should fail open based on environment."""
+        if self.ip_allowlist_fail_open is not None:
+            return self.ip_allowlist_fail_open
+        # Auto-detect: fail-open in dev, fail-closed in prod/staging
+        return self.environment.lower() in ("development", "test", "dev")
     
     def validate_production_settings(self):
         """Validate settings for production environment."""
