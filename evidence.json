@@ -1,0 +1,20 @@
+{
+  "certificate_id": "e5268db9-3a30-4ecc-86de-a6fa407b0e7d",
+  "issued_at": "2025-12-17T21:31:35.454167",
+  "decision": "REVIEW",
+  "policy_version": "ORIGIN-CORE-v1.0",
+  "inputs_hash": "e25f7d0f751cd5b6b8b629bfd26472ec2feacec7457e487aeb92f87f5e523efa",
+  "outputs_hash": "0713dc7aa631b0b90a1a119814411b4aab2fc69cb7986633fd222556cf949220",
+  "ledger_hash": "e66c6978bdbb91505e0c8849d58682a22f5b907037c4d1dabee8ea74c960e8fa",
+  "signature": "HpC0nMMjB3IZ/fTky0NjWqXfJr7zLGEamFC5AG3JETFkNePJsmpSe9KPV0lnJKwga3mhkhzlaiui28RbdcoS1VLhqzVDjz//7Cusb3241qFtR8HnHxJNgtc39NixZLAP/z3zYTpzUM2SF6kyU+G548HSl+CVrGuXOFKxcyiYDdJ82FDf/Tq9SDGaFW129Pphyphd4OF59VdLANF1tARCs8ywn3cLplfLXUZS3eR8nx40ID0EPVTY5j9v4+D/Nj4/BK8vRV6H0MesaGTniNqQ1ioAJxR2v5PkrJi/EJ3eubQvP9kZIvm+2RI3CQ1/co4IgcBalvLSMW9BizmVqf6BrQ==",
+  "upload": {
+    "ingestion_id": "4642217a-3aee-4cd0-8496-7aa096f14e94",
+    "external_id": "upload-001",
+    "received_at": "2025-12-17T21:31:35.421530",
+    "pvid": "PVID-980643FD29464920"
+  },
+  "scores": {
+    "risk_score": 62.53,
+    "assurance_score": 44.99
+  }
+}

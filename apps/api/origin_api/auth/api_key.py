@@ -1,91 +1,62 @@
-"""API key authentication with scalable prefix+digest lookup."""
+"""API key authentication."""
 
 import hashlib
-import hmac
-from datetime import datetime
 from typing import Optional
 
+import bcrypt
 from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from origin_api.db.session import get_db
 from origin_api.models import APIKey, Tenant
-from origin_api.settings import get_settings
 
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-settings = get_settings()
 
 
-def compute_key_prefix(raw_key: str) -> str:
-    """Compute prefix (first 8 chars) of API key."""
-    return raw_key[:8] if len(raw_key) >= 8 else raw_key
+def hash_api_key(api_key: str) -> str:
+    """Hash an API key using bcrypt."""
+    # Bcrypt has 72-byte limit, truncate if necessary
+    api_key_bytes = api_key.encode('utf-8')
+    if len(api_key_bytes) > 72:
+        api_key_bytes = api_key_bytes[:72]
+    return bcrypt.hashpw(api_key_bytes, bcrypt.gensalt()).decode('utf-8')
 
 
-def compute_key_digest(raw_key: str) -> str:
-    """Compute HMAC-SHA256 digest of API key."""
-    secret = settings.secret_key.encode()
-    return hmac.new(secret, raw_key.encode(), hashlib.sha256).hexdigest()
-
-
-def hash_api_key_bcrypt(api_key: str) -> str:
-    """Hash an API key using bcrypt (legacy only)."""
-    return pwd_context.hash(api_key)
-
-
-def verify_api_key_bcrypt(api_key: str, hashed: str) -> bool:
-    """Verify an API key against bcrypt hash (legacy only)."""
-    return pwd_context.verify(api_key, hashed)
+def verify_api_key(api_key: str, hashed: str) -> bool:
+    """Verify an API key against its hash."""
+    try:
+        # Bcrypt has 72-byte limit, truncate if necessary
+        api_key_bytes = api_key.encode('utf-8')
+        if len(api_key_bytes) > 72:
+            api_key_bytes = api_key_bytes[:72]
+        return bcrypt.checkpw(api_key_bytes, hashed.encode('utf-8'))
+    except Exception:
+        return False
 
 
 def get_tenant_by_api_key(db: Session, api_key: str) -> Optional[Tenant]:
-    """Get tenant by API key using scalable prefix+digest lookup."""
-    if not api_key or len(api_key) < 8:
-        return None
-
-    # Compute prefix and digest
-    prefix = compute_key_prefix(api_key)
-    digest = compute_key_digest(api_key)
-
-    # Query with indexed prefix lookup (O(1) with index)
+    """Get tenant by API key."""
+    # Find active API key
     api_key_obj = (
         db.query(APIKey)
         .filter(
-            APIKey.prefix == prefix,
             APIKey.is_active == True,  # noqa: E712
             APIKey.revoked_at.is_(None),
         )
-        .first()
+        .all()
     )
 
-    if api_key_obj:
-        # Constant-time comparison of digest
-        if api_key_obj.digest and hmac.compare_digest(api_key_obj.digest, digest):
-            # Update last_used_at (best-effort, non-blocking)
-            # Use a lightweight update strategy to avoid blocking on every request
-            try:
-                # Only update if last_used_at is None or older than 1 hour
-                should_update = (
-                    api_key_obj.last_used_at is None
-                    or (datetime.utcnow() - api_key_obj.last_used_at).total_seconds() > 3600
-                )
-                if should_update:
-                    api_key_obj.last_used_at = datetime.utcnow()
-                    db.commit()
-            except Exception:
-                # Best-effort: if update fails, continue anyway
-                db.rollback()
-            
-            return db.query(Tenant).filter(Tenant.id == api_key_obj.tenant_id).first()
+    # Check each API key hash
+    for key_obj in api_key_obj:
+        if verify_api_key(api_key, key_obj.hash):
+            return db.query(Tenant).filter(Tenant.id == key_obj.tenant_id).first()
 
-    # Legacy fallback (only if feature flag enabled)
-    if settings.legacy_apikey_fallback:
-        tenants = db.query(Tenant).filter(Tenant.status == "active").all()
-        for tenant in tenants:
-            if tenant.api_key_hash and verify_api_key_bcrypt(api_key, tenant.api_key_hash):
-                return tenant
+    # Fallback: check tenant's api_key_hash (legacy)
+    tenants = db.query(Tenant).filter(Tenant.status == "active").all()
+    for tenant in tenants:
+        if verify_api_key(api_key, tenant.api_key_hash):
+            return tenant
 
     return None
 
@@ -115,3 +86,4 @@ async def get_current_tenant(
         )
 
     return tenant
+

@@ -21,8 +21,6 @@ class PolicyProfile(Base):
     thresholds_json = Column(JSON, nullable=True)  # Risk thresholds, assurance thresholds, etc.
     weights_json = Column(JSON, nullable=True)  # Feature weights for policy rules
     ruleset_ref = Column(String(255), nullable=True)  # Reference to policy ruleset (OPA bundle or JSON)
-    risk_model_version = Column(String(100), nullable=True)  # ML model version used for risk scoring
-    anomaly_model_version = Column(String(100), nullable=True)  # ML model version used for anomaly detection
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -47,9 +45,6 @@ class DecisionCertificate(Base):
     outputs_hash = Column(String(255), nullable=False)  # Hash of decision outputs
     ledger_hash = Column(String(255), nullable=False, index=True)  # Hash of ledger event
     signature = Column(Text, nullable=False)  # Cryptographic signature
-    key_id = Column(String(100), nullable=True)  # Key ID (kid) for key rotation
-    alg = Column(String(20), default="PS256", nullable=False)  # Signature algorithm (PS256 for RSA-PSS SHA-256)
-    signature_encoding = Column(String(20), default="base64", nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships

@@ -42,7 +42,7 @@ pandas>=2.1.0
 pyarrow>=14.0.0
 
 # Fingerprinting
-chromaprint-python>=0.7
+# chromaprint-python>=0.7  # Note: Not available on PyPI, install separately if needed
 
 # Utilities
 python-multipart>=0.0.6

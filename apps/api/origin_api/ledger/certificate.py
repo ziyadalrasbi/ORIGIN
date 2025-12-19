@@ -1,18 +1,19 @@
 """Decision certificate generation and signing."""
 
-import base64
 import hashlib
 import json
 import uuid
 from datetime import datetime
 from typing import Optional
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from sqlalchemy.orm import Session
 
 from origin_api.models import DecisionCertificate, Upload
-from origin_api.ledger.signer import get_signer
+from origin_api.settings import get_settings
 
-signer = get_signer()
+settings = get_settings()
 
 
 class CertificateService:
@@ -21,7 +22,21 @@ class CertificateService:
     def __init__(self, db: Session):
         """Initialize certificate service."""
         self.db = db
-        self.signer = get_signer()
+        self._private_key = None
+        self._load_or_generate_key()
+
+    def _load_or_generate_key(self):
+        """Load or generate signing key."""
+        # In production, load from secure storage
+        # For MVP, generate a key (not secure for production!)
+        from cryptography.hazmat.backends import default_backend
+
+        # Generate a key pair (in production, use a proper key management system)
+        self._private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend(),
+        )
 
     def _hash_inputs(self, inputs: dict) -> str:
         """Hash policy inputs."""
@@ -33,6 +48,20 @@ class CertificateService:
         outputs_str = json.dumps(outputs, sort_keys=True)
         return hashlib.sha256(outputs_str.encode()).hexdigest()
 
+    def _sign(self, data: bytes) -> str:
+        """Sign data with private key."""
+        signature = self._private_key.sign(
+            data,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        # Encode as base64 for storage
+        import base64
+        return base64.b64encode(signature).decode()
+
     def generate_certificate(
         self,
         tenant_id: int,
@@ -41,7 +70,6 @@ class CertificateService:
         inputs: dict,
         outputs: dict,
         ledger_hash: str,
-        evidence_hashes: Optional[dict] = None,
     ) -> DecisionCertificate:
         """Generate signed decision certificate."""
         certificate_id = str(uuid.uuid4())
@@ -50,7 +78,7 @@ class CertificateService:
         inputs_hash = self._hash_inputs(inputs)
         outputs_hash = self._hash_outputs(outputs)
 
-        # Create certificate data (include evidence hashes if provided)
+        # Create certificate data
         certificate_data = {
             "certificate_id": certificate_id,
             "tenant_id": tenant_id,
@@ -61,18 +89,10 @@ class CertificateService:
             "ledger_hash": ledger_hash,
             "issued_at": datetime.utcnow().isoformat(),
         }
-        
-        # Include evidence artifact hashes for tamper-evident verification
-        if evidence_hashes:
-            certificate_data["evidence_hashes"] = evidence_hashes
 
         # Sign certificate
         certificate_bytes = json.dumps(certificate_data, sort_keys=True).encode()
-        signature_bytes = self.signer.sign(certificate_bytes)
-        signature = base64.b64encode(signature_bytes).decode()
-
-        # Get key ID
-        key_id = self.signer.get_key_id()
+        signature = self._sign(certificate_bytes)
 
         # Create certificate record
         certificate = DecisionCertificate(
@@ -85,12 +105,10 @@ class CertificateService:
             outputs_hash=outputs_hash,
             ledger_hash=ledger_hash,
             signature=signature,
-            key_id=key_id,
-            alg=self.signer.get_public_jwk().get("alg", "PS256"),  # Use algorithm from signer JWK
-            signature_encoding="base64",
         )
 
         self.db.add(certificate)
         self.db.flush()
 
         return certificate
+

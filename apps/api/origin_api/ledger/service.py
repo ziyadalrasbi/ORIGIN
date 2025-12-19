@@ -5,10 +5,9 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from origin_api.models import LedgerEvent, TenantSequence
+from origin_api.models import LedgerEvent
 
 
 class LedgerService:
@@ -18,31 +17,21 @@ class LedgerService:
         """Initialize ledger service."""
         self.db = db
 
-    def _allocate_sequence(self, tenant_id: int) -> int:
-        """Allocate next sequence number for tenant (thread-safe)."""
-        # Use SELECT FOR UPDATE to lock the row
-        seq_row = (
-            self.db.query(TenantSequence)
-            .filter(TenantSequence.tenant_id == tenant_id)
-            .with_for_update()
+    def _hash_event(self, event_data: dict) -> str:
+        """Compute hash of event data."""
+        # Create deterministic JSON representation
+        event_str = json.dumps(event_data, sort_keys=True)
+        return hashlib.sha256(event_str.encode()).hexdigest()
+
+    def _get_last_event_hash(self, tenant_id: int) -> Optional[str]:
+        """Get hash of last event for tenant."""
+        last_event = (
+            self.db.query(LedgerEvent)
+            .filter(LedgerEvent.tenant_id == tenant_id)
+            .order_by(LedgerEvent.created_at.desc())
             .first()
         )
-
-        if not seq_row:
-            seq_row = TenantSequence(tenant_id=tenant_id, last_sequence=0)
-            self.db.add(seq_row)
-            self.db.flush()
-
-        seq_row.last_sequence += 1
-        sequence = seq_row.last_sequence
-        self.db.flush()
-        return sequence
-
-    def _hash_canonical_event(self, canonical_event: dict) -> str:
-        """Compute hash of canonical event JSON."""
-        # Create deterministic JSON (sorted keys, no whitespace)
-        event_str = json.dumps(canonical_event, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(event_str.encode()).hexdigest()
+        return last_event.event_hash if last_event else None
 
     def append_event(
         self,
@@ -52,28 +41,21 @@ class LedgerService:
         payload: dict,
     ) -> LedgerEvent:
         """Append event to ledger with hash chaining."""
-        # Allocate sequence number (thread-safe)
-        tenant_sequence = self._allocate_sequence(tenant_id)
-
         # Get previous event hash
         previous_hash = self._get_last_event_hash(tenant_id)
 
-        # Set fixed timestamp
-        event_timestamp = datetime.utcnow()
-
-        # Build canonical event JSON (exact structure that will be hashed)
-        canonical_event = {
+        # Create event data
+        event_data = {
             "tenant_id": tenant_id,
-            "tenant_sequence": tenant_sequence,
             "correlation_id": correlation_id,
             "event_type": event_type,
             "payload": payload,
-            "previous_event_hash": previous_hash,
-            "event_timestamp": event_timestamp.isoformat(),
+            "previous_hash": previous_hash,
+            "timestamp": datetime.utcnow().isoformat(),
         }
 
-        # Compute hash from canonical event only
-        event_hash = self._hash_canonical_event(canonical_event)
+        # Compute event hash
+        event_hash = self._hash_event(event_data)
 
         # Create ledger event
         ledger_event = LedgerEvent(
@@ -81,11 +63,8 @@ class LedgerService:
             previous_event_hash=previous_hash,
             correlation_id=correlation_id,
             tenant_id=tenant_id,
-            tenant_sequence=tenant_sequence,
             event_type=event_type,
-            event_timestamp=event_timestamp,
             payload_json=payload,
-            canonical_event_json=canonical_event,
         )
 
         self.db.add(ledger_event)
@@ -93,50 +72,38 @@ class LedgerService:
 
         return ledger_event
 
-    def _get_last_event_hash(self, tenant_id: int) -> Optional[str]:
-        """Get hash of last event for tenant."""
-        last_event = (
-            self.db.query(LedgerEvent)
-            .filter(LedgerEvent.tenant_id == tenant_id)
-            .order_by(LedgerEvent.tenant_sequence.desc())
-            .first()
-        )
-        return last_event.event_hash if last_event else None
-
-    def verify_chain(self, tenant_id: int) -> tuple[bool, Optional[str]]:
-        """Verify hash chain integrity for tenant.
-        
-        Returns:
-            (is_valid, error_message)
-        """
+    def verify_chain(self, tenant_id: int) -> bool:
+        """Verify hash chain integrity for tenant."""
         events = (
             self.db.query(LedgerEvent)
             .filter(LedgerEvent.tenant_id == tenant_id)
-            .order_by(LedgerEvent.tenant_sequence.asc())
+            .order_by(LedgerEvent.created_at.asc())
             .all()
         )
 
         if not events:
-            return True, None
+            return True
 
         previous_hash = None
-        expected_sequence = 1
-
         for event in events:
-            # Verify sequence is monotonic
-            if event.tenant_sequence != expected_sequence:
-                return False, f"Sequence mismatch: expected {expected_sequence}, got {event.tenant_sequence}"
-
-            # Verify previous hash links
+            # Verify previous hash matches
             if event.previous_event_hash != previous_hash:
-                return False, f"Previous hash mismatch at sequence {event.tenant_sequence}"
+                return False
 
-            # Verify event hash matches canonical event
-            computed_hash = self._hash_canonical_event(event.canonical_event_json)
+            # Verify event hash
+            event_data = {
+                "tenant_id": event.tenant_id,
+                "correlation_id": event.correlation_id,
+                "event_type": event.event_type,
+                "payload": event.payload_json,
+                "previous_hash": event.previous_event_hash,
+                "timestamp": event.created_at.isoformat(),
+            }
+            computed_hash = self._hash_event(event_data)
             if computed_hash != event.event_hash:
-                return False, f"Hash mismatch at sequence {event.tenant_sequence}"
+                return False
 
             previous_hash = event.event_hash
-            expected_sequence += 1
 
-        return True, None
+        return True
+

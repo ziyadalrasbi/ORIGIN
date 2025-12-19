@@ -19,13 +19,9 @@ class EvidencePack(Base):
     certificate_id = Column(Integer, ForeignKey("decision_certificates.id"), nullable=False, index=True)
     status = Column(String(50), default="pending", nullable=False, index=True)  # pending, processing, ready, failed
     formats = Column(JSON, nullable=True)  # ["json", "pdf", "html"]
-    storage_refs = Column(JSON, nullable=True)  # Legacy: {"json": "s3://...", "pdf": "s3://...", "html": "s3://..."}
-    storage_keys = Column(JSON, nullable=True)  # {"json": "evidence/{cert_id}/evidence.json", ...}
-    artifact_hashes = Column(JSON, nullable=True)  # {"json": "sha256:...", "pdf": "sha256:..."}
-    artifact_sizes = Column(JSON, nullable=True)  # {"json": 1234, "pdf": 5678}
+    storage_refs = Column(JSON, nullable=True)  # {"json": "s3://...", "pdf": "s3://...", "html": "s3://..."}
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     ready_at = Column(DateTime, nullable=True)
-    generated_at = Column(DateTime, nullable=True)
 
     # Relationships
     tenant = relationship("Tenant")

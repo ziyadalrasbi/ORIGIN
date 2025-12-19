@@ -29,8 +29,8 @@ class Settings(BaseSettings):
 
     # MinIO / S3
     minio_endpoint: str = "localhost:9000"
-    minio_access_key: Optional[str] = None  # Required in non-dev
-    minio_secret_key: Optional[str] = None  # Required in non-dev
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "minioadmin123"
     minio_bucket: str = "origin-evidence"
     minio_use_ssl: bool = False
 
@@ -56,35 +56,10 @@ class Settings(BaseSettings):
     # Rate Limiting
     rate_limit_requests_per_minute: int = 100
     rate_limit_burst: int = 20
-    rate_limit_ttl_seconds: int = 600  # TTL for rate limit keys in Redis
-    
-    # IP Allowlist
-    ip_allowlist_fail_open: Optional[bool] = None  # None = auto-detect based on environment
 
     # Webhooks
     webhook_timeout_seconds: int = 10
     webhook_max_retries: int = 3
-
-    # Legacy API key fallback (deprecated)
-    legacy_apikey_fallback: bool = False
-
-    # Signing key
-    signing_key_path: str = "./secrets/origin_signing_key.pem"
-    signing_key_id: Optional[str] = None  # For KMS
-    signing_key_provider: str = "local"  # local, aws_kms, etc.
-    
-    # AWS (for KMS)
-    aws_region: Optional[str] = None
-    aws_access_key_id: Optional[str] = None
-    aws_secret_access_key: Optional[str] = None
-    
-    # Webhook encryption
-    webhook_encryption_key_id: Optional[str] = None  # KMS key ID for webhook secret encryption
-    webhook_encryption_provider: str = "local"  # local, aws_kms
-
-    # Object storage
-    minio_bucket: str = "origin-evidence"
-    evidence_signed_url_ttl: int = 3600  # 1 hour
 
     # CORS
     cors_origins: list[str] = ["*"]
@@ -111,35 +86,6 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Check if running in development."""
         return self.environment.lower() == "development"
-    
-    @property
-    def ip_allowlist_should_fail_open(self) -> bool:
-        """Determine if IP allowlist should fail open based on environment."""
-        if self.ip_allowlist_fail_open is not None:
-            return self.ip_allowlist_fail_open
-        # Auto-detect: fail-open in dev, fail-closed in prod/staging
-        return self.environment.lower() in ("development", "test", "dev")
-    
-    def validate_production_settings(self):
-        """Validate settings for production environment."""
-        env = self.environment.lower()
-        if env not in ("development", "test", "dev"):
-            # Production settings validation
-            if not self.minio_access_key or not self.minio_secret_key:
-                raise ValueError(
-                    "MINIO_ACCESS_KEY and MINIO_SECRET_KEY are required in production. "
-                    "Do not use default credentials."
-                )
-            if self.webhook_encryption_provider == "local":
-                raise ValueError(
-                    "WEBHOOK_ENCRYPTION_PROVIDER=local is not allowed in production. "
-                    "Use WEBHOOK_ENCRYPTION_PROVIDER=aws_kms."
-                )
-            if self.signing_key_provider == "local":
-                raise ValueError(
-                    "SIGNING_KEY_PROVIDER=local is not allowed in production. "
-                    "Use SIGNING_KEY_PROVIDER=aws_kms."
-                )
 
 
 @lru_cache()

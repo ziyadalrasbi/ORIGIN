@@ -17,15 +17,11 @@ class Webhook(Base):
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
     url = Column(Text, nullable=False)
-    secret_ciphertext = Column(Text, nullable=False)  # Encrypted webhook secret
-    secret_key_id = Column(String(255), nullable=False)  # KMS key ID or "local"
-    secret_version = Column(String(100), nullable=True)  # Secret version for rotation
-    encryption_context = Column(JSON, nullable=True)  # KMS encryption context
+    secret_hash = Column(String(255), nullable=False)  # Hashed webhook secret
     events = Column(JSON, nullable=False)  # ["decision.created", "decision.updated", etc.]
     enabled = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-    rotated_at = Column(DateTime, nullable=True)
 
     # Relationships
     tenant = relationship("Tenant")

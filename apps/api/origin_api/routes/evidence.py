@@ -1,5 +1,6 @@
 """Evidence pack routes."""
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -88,28 +89,30 @@ async def request_evidence_pack(
         db.add(evidence_pack)
         db.commit()
 
-    # Enqueue async generation job
-    try:
-        from origin_worker.tasks import generate_evidence_pack
-        correlation_id = getattr(request.state, "correlation_id", None)
-        generate_evidence_pack.delay(certificate.certificate_id, formats, correlation_id)
-    except Exception as e:
-        # Fallback to sync if worker unavailable
-        logger.warning(f"Worker unavailable, generating synchronously: {e}")
-        from origin_api.evidence.generator import EvidencePackGenerator
-        generator = EvidencePackGenerator(db)
-        artifacts = {}
-        if "json" in formats:
-            artifacts["json"] = generator.generate_json(certificate, upload)
-        if "pdf" in formats:
-            artifacts["pdf"] = generator.generate_pdf(certificate, upload)
-        if "html" in formats:
-            artifacts["html"] = generator.generate_html(certificate, upload)
-        storage_refs = generator.save_artifacts(certificate.certificate_id, formats, artifacts)
-        evidence_pack.status = "ready"
-        evidence_pack.storage_refs = storage_refs
-        evidence_pack.ready_at = datetime.utcnow()
-        db.commit()
+    # Trigger async generation (will be handled by worker)
+    # For now, generate synchronously
+    generator = EvidencePackGenerator(db)
+    artifacts = {}
+
+    if "json" in formats:
+        artifacts["json"] = generator.generate_json(certificate, upload)
+
+    if "pdf" in formats:
+        artifacts["pdf"] = generator.generate_pdf(certificate, upload)
+
+    if "html" in formats:
+        artifacts["html"] = generator.generate_html(certificate, upload)
+
+    # Save artifacts
+    storage_refs = generator.save_artifacts(
+        certificate.certificate_id, formats, artifacts
+    )
+
+    # Update evidence pack
+    evidence_pack.status = "ready"
+    evidence_pack.storage_refs = storage_refs
+    evidence_pack.ready_at = datetime.utcnow()
+    db.commit()
 
     return {
         "status": "ready",
@@ -160,21 +163,11 @@ async def get_evidence_pack(
             "certificate_id": certificate_id,
         }
 
-    # Generate signed URLs from storage
+    # Generate signed URLs (for now, return paths - in production, use S3 signed URLs)
     signed_urls = {}
-    storage = S3Storage()
-    
-    if evidence_pack.storage_keys:
-        for fmt, storage_key in evidence_pack.storage_keys.items():
-            try:
-                signed_url = storage.get_signed_url(
-                    storage_key, expires_in=settings.evidence_signed_url_ttl
-                )
-                signed_urls[fmt] = signed_url
-            except Exception as e:
-                logger.error(f"Error generating signed URL for {fmt}: {e}")
-    elif evidence_pack.storage_refs:  # Legacy fallback
+    if evidence_pack.storage_refs:
         for fmt, path in evidence_pack.storage_refs.items():
+            # In production, generate S3 signed URL
             signed_urls[fmt] = f"/v1/evidence-packs/{certificate_id}/download/{fmt}"
 
     return {
@@ -223,28 +216,20 @@ async def download_evidence_pack(
             detail="Evidence pack not ready",
         )
 
-    # Get storage key
-    storage_key = evidence_pack.storage_keys.get(format) if evidence_pack.storage_keys else None
-    if not storage_key:
-        # Legacy fallback
-        storage_path = evidence_pack.storage_refs.get(format) if evidence_pack.storage_refs else None
-        if storage_path:
-            from pathlib import Path
-            file_path = Path(storage_path)
-            if file_path.exists():
-                with open(file_path, "rb") as f:
-                    content = f.read()
-            else:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Format {format} not available",
-            )
-    else:
-        # Get from object storage
-        storage = S3Storage()
-        content = storage.get_object(storage_key)
+    # Get storage path
+    storage_path = evidence_pack.storage_refs.get(format)
+    if not storage_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Format {format} not available",
+        )
+
+    # Read file
+    from pathlib import Path
+
+    file_path = Path(storage_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     # Determine content type
     content_types = {
@@ -253,22 +238,14 @@ async def download_evidence_pack(
         "html": "text/html",
     }
 
-    # Include hash metadata in headers for verification
-    headers = {
-        "Content-Disposition": f'attachment; filename="evidence.{format}"',
-    }
-    
-    # Add hash header if available
-    if evidence_pack.artifact_hashes and format in evidence_pack.artifact_hashes:
-        headers["X-Origin-Artifact-Hash"] = evidence_pack.artifact_hashes[format]
-    
-    # Add size header if available
-    if evidence_pack.artifact_sizes and format in evidence_pack.artifact_sizes:
-        headers["X-Origin-Artifact-Size"] = str(evidence_pack.artifact_sizes[format])
+    with open(file_path, "rb") as f:
+        content = f.read()
 
     return Response(
         content=content,
         media_type=content_types.get(format, "application/octet-stream"),
-        headers=headers,
+        headers={
+            "Content-Disposition": f'attachment; filename="evidence.{format}"',
+        },
     )
 

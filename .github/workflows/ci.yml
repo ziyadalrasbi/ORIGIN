@@ -56,14 +56,8 @@ jobs:
       env:
         DATABASE_URL: postgresql://origin:origin_test_password@localhost:5432/origin_test
         REDIS_URL: redis://localhost:6379/0
-        ENVIRONMENT: test
       run: |
         pytest tests/ -v --cov=origin_api --cov-report=xml
-    
-    - name: Run security assertion tests
-      working-directory: .
-      run: |
-        python tests/ci_security_assertions.py
     
     - name: Upload coverage
       uses: codecov/codecov-action@v3

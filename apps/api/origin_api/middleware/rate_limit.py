@@ -58,11 +58,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Consume token
         tokens -= 1
 
-        # Update state with TTL to prevent key accumulation
-        ttl = settings.rate_limit_ttl_seconds
+        # Update state
         pipe = redis_client.pipeline()
-        pipe.set(key, tokens, ex=ttl)  # Set TTL on tokens key
-        pipe.set(f"{key}:last_refill", now, ex=ttl)  # Set TTL on last_refill key
+        pipe.set(key, tokens)
+        pipe.set(f"{key}:last_refill", now)
         pipe.execute()
 
         # Process request
