@@ -7,7 +7,7 @@ from typing import Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from origin_api.models import Account, DeviceFingerprint, IdentityEntity, IdentityRelationship
+from origin_api.models import Account, DeviceFingerprint, IdentityEntity, IdentityRelationship, Upload
 
 
 class IdentityResolver:
@@ -149,7 +149,17 @@ class IdentityResolver:
         }
 
     def compute_identity_features(self, tenant_id: int, account_entity_id: int) -> dict:
-        """Compute identity graph features."""
+        """
+        Compute identity graph features.
+        
+        Features computed:
+        - shared_device_count: Number of devices linked to this account
+        - relationship_count: Total identity relationships
+        - prior_quarantine_count: Count of prior QUARANTINE decisions for this account
+        - identity_confidence: 0-100 score based on graph features
+        
+        Returns dict with all computed features.
+        """
         # Count shared devices
         shared_device_count = (
             self.db.query(func.count(IdentityRelationship.id))
@@ -178,8 +188,23 @@ class IdentityResolver:
             or 0
         )
 
-        # Check for prior quarantines (will be computed from uploads in later steps)
-        prior_quarantine_count = 0  # TODO: Query from uploads table
+        # Query prior quarantines from uploads table
+        # Get account_id from entity attributes if available
+        account_id = None
+        if account_entity.attributes_json and "account_id" in account_entity.attributes_json:
+            account_id = account_entity.attributes_json["account_id"]
+        
+        prior_quarantine_count = 0
+        if account_id:
+            prior_quarantine_count = (
+                self.db.query(Upload)
+                .filter(
+                    Upload.tenant_id == tenant_id,
+                    Upload.account_id == account_id,
+                    Upload.decision == "QUARANTINE",
+                )
+                .count()
+            )
 
         # Compute confidence score (0-100)
         # Higher confidence = more established identity

@@ -78,8 +78,17 @@ def generate_synthetic_dataset(n_samples: int = 1000, output_path: str = "synthe
             synthetic_likelihood += 30
 
         # Generate label based on profile and scores
+        # Deterministic rule for REJECT: extreme fraud cases
         is_clean = random.random() < profile["clean_ratio"]
-        if risk_score > 70 or prior_quarantine_count > 0:
+        
+        # REJECT: extreme fraud cases
+        if (
+            (risk_score > 85 and prior_quarantine_count >= 2)
+            or (risk_score > 90)
+            or (profile_name in ["spam_creator", "identity_hopper"] and risk_score > 80 and prior_quarantine_count >= 1)
+        ):
+            label = "REJECT"
+        elif risk_score > 70 or prior_quarantine_count > 0:
             label = "QUARANTINE"
         elif risk_score > 40 or identity_confidence < 30:
             label = "REVIEW"

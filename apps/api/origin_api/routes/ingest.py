@@ -115,11 +115,30 @@ async def ingest(
     # Step 7-8: ML Risk Signals
     ml_service = get_inference_service()
     
-    # Compute account age (simplified - in production, use account.created_at)
-    account_age_days = 30  # Placeholder
+    # Compute account age in days
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    # Ensure account.created_at is timezone-aware for comparison
+    account_created = account.created_at
+    if account_created.tzinfo is None:
+        account_created = account_created.replace(tzinfo=timezone.utc)
+    account_age_days = max(0, (now - account_created).days)
     
-    # Get upload velocity (simplified - in production, query recent uploads)
-    upload_velocity = 1  # Placeholder
+    # Get upload velocity (uploads in last 24 hours)
+    from datetime import timedelta
+    window_start = now - timedelta(hours=24)
+    # Query uploads in the last 24 hours
+    # Note: received_at is stored as timezone-naive UTC datetime
+    window_start_naive = window_start.replace(tzinfo=None)
+    upload_velocity = (
+        db.query(Upload)
+        .filter(
+            Upload.tenant_id == tenant.id,
+            Upload.account_id == account.id,
+            Upload.received_at >= window_start_naive,
+        )
+        .count()
+    )
 
     risk_signals = ml_service.compute_risk_signals(
         account_age_days=account_age_days,

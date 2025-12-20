@@ -79,10 +79,12 @@ async def create_tenant(
         name="default",
         version="ORIGIN-CORE-v1.0",
         thresholds_json={
-            "risk_threshold_review": 30,
+            "risk_threshold_review": 40,
             "risk_threshold_quarantine": 70,
             "risk_threshold_reject": 90,
             "assurance_threshold_allow": 80,
+            "anomaly_threshold": 30,
+            "synthetic_threshold": 70,
         },
         weights_json={},
         is_active=True,

@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import IsolationForest
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
 from ml.training.feature_engineering import prepare_features
@@ -17,8 +18,20 @@ def train_risk_model(dataset_path: str = "ml/datasets/synthetic/synthetic_datase
     # Load data
     df = pd.read_parquet(dataset_path)
 
-    # Prepare features
-    X, y = prepare_features(df)
+    # Prepare features and encode labels
+    feature_cols = [
+        "account_age_days",
+        "shared_device_count",
+        "prior_quarantine_count",
+        "identity_confidence",
+        "upload_velocity",
+        "prior_sightings_count",
+    ]
+    X = df[feature_cols].copy()
+
+    # Encode labels with LabelEncoder
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(df["label"])
 
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(
@@ -52,32 +65,56 @@ def train_risk_model(dataset_path: str = "ml/datasets/synthetic/synthetic_datase
         # Log model
         mlflow.sklearn.log_model(calibrated_model, "model")
 
-        # Save model
+        # Save model and label encoder together
         model_path = "ml/models/risk_model.pkl"
-        joblib.dump(calibrated_model, model_path)
+        artifact = {
+            "model": calibrated_model,
+            "label_encoder": label_encoder,
+        }
+        joblib.dump(artifact, model_path)
         mlflow.log_artifact(model_path)
 
         print(f"Model trained - Train: {train_score:.3f}, Test: {test_score:.3f}")
         print(f"Model saved to: {model_path}")
+        print(f"Label classes: {label_encoder.classes_}")
 
     return calibrated_model
 
 
 def train_anomaly_model(dataset_path: str = "ml/datasets/synthetic/synthetic_dataset.parquet"):
-    """Train anomaly detection model."""
+    """Train anomaly detection model on normal (ALLOW) data only."""
     df = pd.read_parquet(dataset_path)
 
-    # Prepare features (use same features as risk model)
-    X, _ = prepare_features(df)
+    # Filter to only "ALLOW" label for normal behavior baseline
+    normal_df = df[df["label"] == "ALLOW"].copy()
+    
+    if len(normal_df) == 0:
+        raise ValueError("No ALLOW samples found in dataset. Cannot train anomaly model.")
 
-    # Train Isolation Forest
-    model = IsolationForest(contamination=0.1, random_state=42)
-    model.fit(X)
+    # Prepare features (use same features as risk model)
+    feature_cols = [
+        "account_age_days",
+        "shared_device_count",
+        "prior_quarantine_count",
+        "identity_confidence",
+        "upload_velocity",
+        "prior_sightings_count",
+    ]
+    X_normal = normal_df[feature_cols].copy()
+
+    # Train Isolation Forest on normal data only
+    model = IsolationForest(
+        n_estimators=200,
+        contamination=0.05,
+        random_state=42,
+    )
+    model.fit(X_normal)
 
     # Save model
     model_path = "ml/models/anomaly_model.pkl"
     joblib.dump(model, model_path)
 
+    print(f"Anomaly model trained on {len(normal_df)} ALLOW samples")
     print(f"Anomaly model saved to: {model_path}")
     return model
 
