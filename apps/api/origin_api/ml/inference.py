@@ -1,11 +1,15 @@
 """ML inference service for risk signals."""
 
+import logging
+
 import joblib
 import numpy as np
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 class MLInferenceService:
@@ -25,22 +29,33 @@ class MLInferenceService:
         anomaly_model_path = self.model_dir / "anomaly_model.pkl"
 
         if risk_model_path.exists():
-            artifact = joblib.load(risk_model_path)
-            if isinstance(artifact, dict) and "model" in artifact and "label_encoder" in artifact:
-                self.risk_model = artifact["model"]
-                self.risk_label_encoder = artifact["label_encoder"]
-            else:
-                # Backward compatibility: if old format, treat as model only
-                self.risk_model = artifact
+            try:
+                artifact = joblib.load(risk_model_path)
+                if isinstance(artifact, dict) and "model" in artifact and "label_encoder" in artifact:
+                    self.risk_model = artifact["model"]
+                    self.risk_label_encoder = artifact["label_encoder"]
+                    logger.info("Risk model and label encoder loaded successfully")
+                else:
+                    # Backward compatibility: if old format, treat as model only
+                    self.risk_model = artifact
+                    self.risk_label_encoder = None
+                    logger.warning("Risk model loaded without label encoder. Using fallback label mapping.")
+            except Exception as e:
+                logger.exception(f"Failed to load risk model from {risk_model_path}: {e}")
+                self.risk_model = None
                 self.risk_label_encoder = None
-                print("Warning: Risk model loaded without label encoder. Using fallback label mapping.")
         else:
-            print("Warning: Risk model not found. Using fallback heuristics.")
+            logger.warning("Risk model not found. Using fallback heuristics.")
 
         if anomaly_model_path.exists():
-            self.anomaly_model = joblib.load(anomaly_model_path)
+            try:
+                self.anomaly_model = joblib.load(anomaly_model_path)
+                logger.info("Anomaly model loaded successfully")
+            except Exception as e:
+                logger.exception(f"Failed to load anomaly model from {anomaly_model_path}: {e}")
+                self.anomaly_model = None
         else:
-            print("Warning: Anomaly model not found. Using fallback heuristics.")
+            logger.warning("Anomaly model not found. Using fallback heuristics.")
 
     def compute_risk_signals(
         self,
@@ -73,55 +88,66 @@ class MLInferenceService:
         ]])
 
         # Risk score (0-100)
-        if self.risk_model:
+        if not self.risk_model or not self.risk_label_encoder:
+            logger.warning("Risk model or label encoder missing, using fallback heuristics")
+            risk_score = self._fallback_risk_score(
+                account_age_days, prior_quarantine_count, identity_confidence
+            )
+        else:
             try:
                 # Get probability predictions
                 probs = self.risk_model.predict_proba(features)[0]
                 
-                # Use label encoder to get string labels if available
-                if self.risk_label_encoder is not None:
-                    # Get encoded class indices from model
-                    classes_encoded = self.risk_model.classes_
-                    # Decode to string labels
+                # Get encoded class indices from model
+                classes_encoded = self.risk_model.classes_
+                
+                # Decode to string labels with defensive checks
+                try:
                     classes = self.risk_label_encoder.inverse_transform(classes_encoded)
-                    
-                    # Define severity map
-                    severity_map = {
-                        "ALLOW": 0,
-                        "REVIEW": 30,
-                        "QUARANTINE": 70,
-                        "REJECT": 90,
-                    }
-                    
-                    # Compute risk_score via weighted sum over labels
-                    risk_score = 0.0
-                    for p, label in zip(probs, classes):
-                        severity = severity_map.get(label, 50.0)  # default mid-risk if unexpected label
-                        risk_score += p * severity
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Label encoder mismatch with model classes: {e}. Using fallback.")
+                    risk_score = self._fallback_risk_score(
+                        account_age_days, prior_quarantine_count, identity_confidence
+                    )
                 else:
-                    # Fallback: assume fixed ordering if no encoder (backward compatibility)
-                    # This should not happen with new models, but handle gracefully
-                    if len(probs) >= 4:
-                        risk_score = (
-                            probs[0] * 0 +  # ALLOW
-                            probs[1] * 30 +  # REVIEW
-                            probs[2] * 70 +  # QUARANTINE
-                            probs[3] * 90   # REJECT
+                    # Verify we have matching probabilities and classes
+                    if len(probs) != len(classes):
+                        logger.warning(
+                            f"Probability array length ({len(probs)}) doesn't match classes length ({len(classes)}). "
+                            "Using fallback."
                         )
-                    else:
-                        # Handle case where model has fewer classes
                         risk_score = self._fallback_risk_score(
                             account_age_days, prior_quarantine_count, identity_confidence
                         )
+                    else:
+                        # Define severity map
+                        severity_map = {
+                            "ALLOW": 0,
+                            "REVIEW": 30,
+                            "QUARANTINE": 70,
+                            "REJECT": 90,
+                        }
+                        
+                        # Compute risk_score via weighted sum over labels
+                        risk_score = 0.0
+                        unexpected_labels = []
+                        for p, label in zip(probs, classes):
+                            severity = severity_map.get(label, None)
+                            if severity is None:
+                                unexpected_labels.append(label)
+                                severity = 50.0  # default mid-risk if unexpected label
+                            risk_score += p * severity
+                        
+                        if unexpected_labels:
+                            logger.warning(
+                                f"Unexpected labels in model output: {unexpected_labels}. "
+                                "Using default severity (50) for these labels."
+                            )
             except Exception as e:
-                print(f"Error in risk model inference: {e}")
+                logger.exception("Error in risk model inference")
                 risk_score = self._fallback_risk_score(
                     account_age_days, prior_quarantine_count, identity_confidence
                 )
-        else:
-            risk_score = self._fallback_risk_score(
-                account_age_days, prior_quarantine_count, identity_confidence
-            )
 
         # Assurance score (0-100) - confidence it's legitimate
         assurance_score = max(
@@ -135,16 +161,17 @@ class MLInferenceService:
         )
 
         # Anomaly score (0-100)
-        if self.anomaly_model:
+        if not self.anomaly_model:
+            logger.debug("Anomaly model not available, using fallback")
+            anomaly_score = self._fallback_anomaly_score(upload_velocity, shared_device_count)
+        else:
             try:
                 anomaly_score_raw = self.anomaly_model.score_samples(features)[0]
                 # Normalize to 0-100 (lower score = more anomalous)
                 anomaly_score = max(0, min(100, 50 + (anomaly_score_raw * 10)))
             except Exception as e:
-                print(f"Error in anomaly model inference: {e}")
+                logger.exception("Error in anomaly model inference")
                 anomaly_score = self._fallback_anomaly_score(upload_velocity, shared_device_count)
-        else:
-            anomaly_score = self._fallback_anomaly_score(upload_velocity, shared_device_count)
 
         # Synthetic/AI likelihood (placeholder - heuristic for now)
         synthetic_likelihood = self._compute_synthetic_likelihood(

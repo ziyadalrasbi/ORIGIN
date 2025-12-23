@@ -1,13 +1,16 @@
 """Ingest endpoint for content submissions."""
 
 import hashlib
+import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from origin_api.db.session import get_db
 from origin_api.identity.resolver import IdentityResolver
@@ -115,20 +118,19 @@ async def ingest(
     # Step 7-8: ML Risk Signals
     ml_service = get_inference_service()
     
-    # Compute account age in days
-    from datetime import timezone
+    # Compute account age in days with defensive checks
     now = datetime.now(timezone.utc)
-    # Ensure account.created_at is timezone-aware for comparison
     account_created = account.created_at
-    if account_created.tzinfo is None:
-        account_created = account_created.replace(tzinfo=timezone.utc)
-    account_age_days = max(0, (now - account_created).days)
+    if account_created is None:
+        logger.warning(f"Account {account.id} has no created_at timestamp, defaulting to 0 days")
+        account_age_days = 0
+    else:
+        if account_created.tzinfo is None:
+            account_created = account_created.replace(tzinfo=timezone.utc)
+        account_age_days = max(0, (now - account_created).days)
     
-    # Get upload velocity (uploads in last 24 hours)
-    from datetime import timedelta
+    # Get upload velocity (uploads in last 24 hours) with defensive checks
     window_start = now - timedelta(hours=24)
-    # Query uploads in the last 24 hours
-    # Note: received_at is stored as timezone-naive UTC datetime
     window_start_naive = window_start.replace(tzinfo=None)
     upload_velocity = (
         db.query(Upload)
@@ -139,14 +141,38 @@ async def ingest(
         )
         .count()
     )
+    # Ensure non-negative
+    upload_velocity = max(0, upload_velocity)
+
+    # Extract identity features with defensive defaults
+    identity_features = identity_result.get("features", {})
+    shared_device_count = identity_features.get("shared_device_count", 0) or 0
+    prior_quarantine_count = identity_features.get("prior_quarantine_count", 0) or 0
+    identity_confidence = identity_result.get("identity_confidence", 50.0) or 50.0
+    # Ensure identity_confidence is in valid range
+    identity_confidence = max(0.0, min(100.0, float(identity_confidence)))
+    
+    # Extract PVID features with defensive defaults
+    pvid_sightings = pvid_result.get("sightings", {})
+    prior_sightings_count = pvid_sightings.get("prior_sightings_count", 0) or 0
+
+    # Log any unexpected missing values
+    if identity_features.get("shared_device_count") is None:
+        logger.debug(f"shared_device_count missing in identity features, using 0")
+    if identity_features.get("prior_quarantine_count") is None:
+        logger.debug(f"prior_quarantine_count missing in identity features, using 0")
+    if identity_result.get("identity_confidence") is None:
+        logger.debug(f"identity_confidence missing in identity result, using 50.0")
+    if pvid_sightings.get("prior_sightings_count") is None:
+        logger.debug(f"prior_sightings_count missing in PVID result, using 0")
 
     risk_signals = ml_service.compute_risk_signals(
         account_age_days=account_age_days,
-        shared_device_count=identity_result["features"]["shared_device_count"],
-        prior_quarantine_count=identity_result["features"]["prior_quarantine_count"],
-        identity_confidence=identity_result["identity_confidence"],
+        shared_device_count=shared_device_count,
+        prior_quarantine_count=prior_quarantine_count,
+        identity_confidence=identity_confidence,
         upload_velocity=upload_velocity,
-        prior_sightings_count=pvid_result["sightings"]["prior_sightings_count"],
+        prior_sightings_count=prior_sightings_count,
     )
 
     # Step 9: Policy Evaluation

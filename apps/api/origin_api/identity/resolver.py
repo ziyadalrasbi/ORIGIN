@@ -139,7 +139,7 @@ class IdentityResolver:
                 )
 
         # Compute identity features
-        features = self.compute_identity_features(tenant_id, account_entity.id)
+        features = self.compute_identity_features(tenant_id, account_entity.id, account_id=account_id)
 
         return {
             "account_entity_id": account_entity.id,
@@ -148,7 +148,9 @@ class IdentityResolver:
             "features": features,
         }
 
-    def compute_identity_features(self, tenant_id: int, account_entity_id: int) -> dict:
+    def compute_identity_features(
+        self, tenant_id: int, account_entity_id: int, account_id: Optional[int] = None
+    ) -> dict:
         """
         Compute identity graph features.
         
@@ -189,10 +191,15 @@ class IdentityResolver:
         )
 
         # Query prior quarantines from uploads table
-        # Get account_id from entity attributes if available
-        account_id = None
-        if account_entity.attributes_json and "account_id" in account_entity.attributes_json:
-            account_id = account_entity.attributes_json["account_id"]
+        # Use provided account_id, or try to get from entity attributes
+        if account_id is None:
+            account_entity_obj = (
+                self.db.query(IdentityEntity)
+                .filter(IdentityEntity.id == account_entity_id)
+                .first()
+            )
+            if account_entity_obj and account_entity_obj.attributes_json and "account_id" in account_entity_obj.attributes_json:
+                account_id = account_entity_obj.attributes_json["account_id"]
         
         prior_quarantine_count = 0
         if account_id:
