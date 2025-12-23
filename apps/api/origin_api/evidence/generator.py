@@ -3,7 +3,6 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from jinja2 import Template
 from reportlab.lib.pagesizes import letter
@@ -12,7 +11,7 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from sqlalchemy.orm import Session
 
-from origin_api.models import DecisionCertificate, EvidencePack, Upload
+from origin_api.models import DecisionCertificate, EvidencePack, Upload, LedgerEvent
 from origin_api.settings import get_settings
 
 settings = get_settings()
@@ -28,6 +27,33 @@ class EvidencePackGenerator:
 
     def generate_json(self, certificate: DecisionCertificate, upload: Upload) -> dict:
         """Generate JSON evidence pack."""
+        # Retrieve ledger event for decision trace (best-effort)
+        decision_trace = {
+            "decision": upload.decision,
+            "risk_score": float(upload.risk_score) if upload.risk_score is not None else None,
+            "assurance_score": float(upload.assurance_score) if upload.assurance_score is not None else None,
+            "triggered_rules": [],
+            "reason_codes": [],
+            "rationale": None,
+            "ml_signals": {},
+        }
+        ledger_event = (
+            self.db.query(LedgerEvent)
+            .filter(LedgerEvent.event_hash == certificate.ledger_hash)
+            .first()
+        )
+        if ledger_event and ledger_event.payload_json:
+            decision_payload = ledger_event.payload_json.get("outputs", {})
+            decision_trace = {
+                "decision": decision_payload.get("decision", upload.decision),
+                "risk_score": decision_payload.get("risk_score"),
+                "assurance_score": decision_payload.get("assurance_score"),
+                "triggered_rules": decision_payload.get("triggered_rules", []),
+                "reason_codes": decision_payload.get("reason_codes", []),
+                "rationale": decision_payload.get("rationale"),
+                "ml_signals": decision_payload.get("ml_signals", {}),
+            }
+
         evidence = {
             "certificate_id": certificate.certificate_id,
             "issued_at": certificate.issued_at.isoformat(),
@@ -47,6 +73,7 @@ class EvidencePackGenerator:
                 "risk_score": float(upload.risk_score) if upload.risk_score else None,
                 "assurance_score": float(upload.assurance_score) if upload.assurance_score else None,
             },
+            "decision_trace": decision_trace,
         }
         return evidence
 

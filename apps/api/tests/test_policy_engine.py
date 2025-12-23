@@ -9,8 +9,8 @@ from origin_api.policy.engine import PolicyEngine
 class TestPolicyEngine:
     """Test policy engine decision evaluation."""
 
-    def test_allow_decision_low_risk_high_assurance(self):
-        """Test ALLOW decision for low risk, high assurance."""
+    def test_allow_decision_low_risk_profile(self):
+        """Test ALLOW decision for low risk profile with no signals."""
         db = Mock()
         engine = PolicyEngine(db)
 
@@ -28,20 +28,21 @@ class TestPolicyEngine:
         result = engine.evaluate_decision(
             tenant_id=1,
             risk_score=20.0,  # Low risk
-            assurance_score=85.0,  # High assurance
+            assurance_score=70.0,
             anomaly_score=60.0,
             synthetic_likelihood=30.0,
             has_prior_quarantine=False,
             has_prior_reject=False,
-            prior_sightings_count=5,
+            prior_sightings_count=2,
             identity_confidence=80.0,
         )
 
         assert result["decision"] == "ALLOW"
-        assert "HIGH_ASSURANCE" in result["reason_codes"]
+        assert "LOW_RISK_NO_SIGNALS" in result["reason_codes"]
+        assert "LOW_RISK_PROFILE" in result["triggered_rules"]
 
-    def test_review_decision_moderate_risk(self):
-        """Test REVIEW decision for moderate risk above review threshold."""
+    def test_review_decision_moderate_risk_band(self):
+        """Test REVIEW decision for risk between review and quarantine thresholds."""
         db = Mock()
         engine = PolicyEngine(db)
 
@@ -56,7 +57,7 @@ class TestPolicyEngine:
 
         result = engine.evaluate_decision(
             tenant_id=1,
-            risk_score=50.0,  # Moderate risk, above review threshold
+            risk_score=50.0,  # Moderate risk, between review and quarantine
             assurance_score=60.0,
             anomaly_score=50.0,
             synthetic_likelihood=40.0,
@@ -67,6 +68,7 @@ class TestPolicyEngine:
         )
 
         assert result["decision"] == "REVIEW"
+        assert "RISK_SCORE_MODERATE" in result["reason_codes"]
 
     def test_quarantine_decision_high_risk(self):
         """Test QUARANTINE decision for high risk above quarantine threshold."""
@@ -185,5 +187,37 @@ class TestPolicyEngine:
 
         assert result["decision"] == "QUARANTINE"
         assert "SYNTHETIC_LIKELY_FIRST_SEEN" in result["reason_codes"]
+
+    def test_default_review_fallback(self):
+        """Test default review fallback when no explicit rule fires."""
+        db = Mock()
+        engine = PolicyEngine(db)
+
+        mock_policy = Mock()
+        mock_policy.version = "ORIGIN-CORE-v1.0"
+        mock_policy.thresholds_json = {
+            "risk_threshold_review": 40,
+            "risk_threshold_quarantine": 70,
+            "risk_threshold_reject": 90,
+            "anomaly_threshold": 30,
+            "synthetic_threshold": 70,
+        }
+        engine.get_policy_profile = Mock(return_value=mock_policy)
+
+        result = engine.evaluate_decision(
+            tenant_id=1,
+            risk_score=35.0,  # below review threshold
+            assurance_score=70.0,
+            anomaly_score=40.0,  # above anomaly threshold
+            synthetic_likelihood=40.0,  # below synthetic threshold
+            has_prior_quarantine=False,
+            has_prior_reject=False,
+            prior_sightings_count=0,  # fails low-risk allow due to no prior sightings
+            identity_confidence=50.0,
+        )
+
+        assert result["decision"] == "REVIEW"
+        assert "DEFAULT_REVIEW" in result["triggered_rules"]
+        assert "REQUIRES_MANUAL_REVIEW" in result["reason_codes"]
 
 

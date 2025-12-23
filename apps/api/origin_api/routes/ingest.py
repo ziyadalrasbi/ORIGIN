@@ -4,7 +4,7 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Request, status
 from pydantic import BaseModel, Field
@@ -50,6 +50,10 @@ class IngestResponse(BaseModel):
     certificate_id: Optional[str] = None
     ledger_hash: Optional[str] = None
     reasons: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    triggered_rules: List[str] = Field(default_factory=list)
+    decision_rationale: str = ""
+    ml_signals: Dict[str, Any] = Field(default_factory=dict)
     evidence_pack_status: str = "pending"
     evidence_pack_request_url: Optional[str] = None
 
@@ -132,7 +136,7 @@ async def ingest(
     # Get upload velocity (uploads in last 24 hours) with defensive checks
     window_start = now - timedelta(hours=24)
     window_start_naive = window_start.replace(tzinfo=None)
-    upload_velocity = (
+    upload_velocity_24h = (
         db.query(Upload)
         .filter(
             Upload.tenant_id == tenant.id,
@@ -142,7 +146,7 @@ async def ingest(
         .count()
     )
     # Ensure non-negative
-    upload_velocity = max(0, upload_velocity)
+    upload_velocity_24h = max(0, upload_velocity_24h)
 
     # Extract identity features with defensive defaults
     identity_features = identity_result.get("features", {})
@@ -171,7 +175,7 @@ async def ingest(
         shared_device_count=shared_device_count,
         prior_quarantine_count=prior_quarantine_count,
         identity_confidence=identity_confidence,
-        upload_velocity=upload_velocity,
+        upload_velocity=upload_velocity_24h,
         prior_sightings_count=prior_sightings_count,
     )
 
@@ -186,8 +190,22 @@ async def ingest(
         has_prior_quarantine=pvid_result["sightings"]["has_prior_quarantine"],
         has_prior_reject=pvid_result["sightings"]["has_prior_reject"],
         prior_sightings_count=pvid_result["sightings"]["prior_sightings_count"],
-        identity_confidence=identity_result["identity_confidence"],
+        identity_confidence=identity_confidence,
     )
+
+    ml_signals = {
+        "risk_score": risk_signals["risk_score"],
+        "assurance_score": risk_signals["assurance_score"],
+        "anomaly_score": risk_signals["anomaly_score"],
+        "synthetic_likelihood": risk_signals["synthetic_likelihood"],
+        "identity_confidence": identity_confidence,
+        "account_age_days": account_age_days,
+        "upload_velocity_24h": upload_velocity_24h,
+        "prior_sightings_count": prior_sightings_count,
+        "prior_quarantine_count": prior_quarantine_count,
+        "has_prior_quarantine": pvid_result["sightings"]["has_prior_quarantine"],
+        "has_prior_reject": pvid_result["sightings"]["has_prior_reject"],
+    }
 
     # Create upload record
     upload = Upload(
@@ -238,6 +256,8 @@ async def ingest(
         "assurance_score": risk_signals["assurance_score"],
         "triggered_rules": decision_result["triggered_rules"],
         "reason_codes": decision_result["reason_codes"],
+        "rationale": decision_result.get("rationale"),
+        "ml_signals": ml_signals,
     }
 
     # Append ledger event
@@ -281,7 +301,7 @@ async def ingest(
         )
     except Exception as e:
         # Log but don't fail the request
-        print(f"Webhook delivery failed: {e}")
+        logger.warning("Webhook delivery failed", exc_info=e)
 
     return IngestResponse(
         ingestion_id=ingestion_id,
@@ -292,6 +312,10 @@ async def ingest(
         certificate_id=certificate.certificate_id,
         ledger_hash=ledger_event.event_hash,
         reasons=decision_result["reason_codes"],
+        reason_codes=decision_result["reason_codes"],
+        triggered_rules=decision_result["triggered_rules"],
+        decision_rationale=decision_result.get("rationale", ""),
+        ml_signals=ml_signals,
         evidence_pack_status="pending",
         evidence_pack_request_url=f"/v1/evidence-packs?certificate_id={certificate.certificate_id}",
     )

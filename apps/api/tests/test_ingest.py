@@ -34,6 +34,11 @@ def test_ingest_basic(api_key):
     assert "ingestion_id" in data
     assert "decision" in data
     assert data["decision"] in ["ALLOW", "REVIEW", "QUARANTINE", "REJECT"]
+    assert "triggered_rules" in data
+    assert "decision_rationale" in data
+    assert "ml_signals" in data
+    assert "risk_score" in data["ml_signals"]
+    assert "assurance_score" in data["ml_signals"]
 
 
 def test_ingest_missing_api_key():

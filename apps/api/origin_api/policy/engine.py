@@ -1,10 +1,12 @@
 """Policy engine for deterministic decision making."""
 
-from typing import Optional
+import logging
 
 from sqlalchemy.orm import Session
 
 from origin_api.models import PolicyProfile
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyEngine:
@@ -82,6 +84,28 @@ class PolicyEngine:
         - anomaly_threshold: ~30 (default, lower = more anomalous)
         - synthetic_threshold: ~70 (default)
         """
+        logger.debug(
+            "Policy evaluation start",
+            extra={
+                "tenant_id": tenant_id,
+                "risk_score": risk_score,
+                "assurance_score": assurance_score,
+                "anomaly_score": anomaly_score,
+                "synthetic_likelihood": synthetic_likelihood,
+                "prior_sightings_count": prior_sightings_count,
+                "identity_confidence": identity_confidence,
+            },
+        )
+        def _log_and_return(payload: dict) -> dict:
+            logger.debug(
+                "Policy evaluation result",
+                extra={
+                    "decision": payload.get("decision"),
+                    "triggered_rules": payload.get("triggered_rules"),
+                    "reason_codes": payload.get("reason_codes"),
+                },
+            )
+            return payload
         policy = self.get_policy_profile(tenant_id)
         thresholds = policy.thresholds_json or {}
 
@@ -92,24 +116,24 @@ class PolicyEngine:
         if has_prior_reject:
             triggered_rules.append("HARD_BLOCK_PRIOR_REJECT")
             reason_codes.append("PRIOR_REJECT")
-            return {
+            return _log_and_return({
                 "decision": "REJECT",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": "Content was previously rejected",
-            }
+            })
 
         if has_prior_quarantine:
             triggered_rules.append("HARD_BLOCK_PRIOR_QUARANTINE")
             reason_codes.append("PRIOR_QUARANTINE")
-            return {
+            return _log_and_return({
                 "decision": "QUARANTINE",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": "Content was previously quarantined",
-            }
+            })
 
         # Risk-based decisions
         risk_threshold_reject = thresholds.get("risk_threshold_reject", 90)
@@ -122,40 +146,81 @@ class PolicyEngine:
         if risk_score >= risk_threshold_reject:
             triggered_rules.append("RISK_THRESHOLD_REJECT")
             reason_codes.append("RISK_SCORE_HIGH")
-            return {
+            return _log_and_return({
                 "decision": "REJECT",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Risk score {risk_score:.1f} exceeds reject threshold {risk_threshold_reject}",
-            }
+            })
 
         # QUARANTINE: High risk
         if risk_score >= risk_threshold_quarantine:
             triggered_rules.append("RISK_THRESHOLD_QUARANTINE")
             reason_codes.append("RISK_SCORE_HIGH")
-            return {
+            return _log_and_return({
                 "decision": "QUARANTINE",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Risk score {risk_score:.1f} exceeds quarantine threshold {risk_threshold_quarantine}",
+            })
+
+        # LOW RISK ALLOW: below review threshold with no other risk signals
+        if (
+            risk_score < risk_threshold_review
+            and anomaly_score >= anomaly_threshold
+            and synthetic_likelihood < synthetic_threshold
+            and identity_confidence >= 40
+            and prior_sightings_count >= 1
+        ):
+            triggered_rules.append("LOW_RISK_PROFILE")
+            reason_codes.append("LOW_RISK_NO_SIGNALS")
+            decision_payload = {
+                "decision": "ALLOW",
+                "policy_version": policy.version,
+                "triggered_rules": triggered_rules,
+                "reason_codes": reason_codes,
+                "rationale": (
+                    f"Low risk profile: risk_score={risk_score:.1f} < review threshold "
+                    f"{risk_threshold_review}, no anomaly/synthetic signals, "
+                    f"identity_confidence={identity_confidence:.1f}, "
+                    f"prior_sightings_count={prior_sightings_count}"
+                ),
             }
+            return _log_and_return(decision_payload)
+
+        # MID RISK REVIEW: between review and quarantine thresholds
+        if risk_score >= risk_threshold_review and risk_score < risk_threshold_quarantine:
+            triggered_rules.append("RISK_THRESHOLD_REVIEW")
+            reason_codes.append("RISK_SCORE_MODERATE")
+            decision_payload = {
+                "decision": "REVIEW",
+                "policy_version": policy.version,
+                "triggered_rules": triggered_rules,
+                "reason_codes": reason_codes,
+                "rationale": (
+                    f"Moderate risk: risk_score={risk_score:.1f} between review "
+                    f"threshold {risk_threshold_review} and quarantine threshold "
+                    f"{risk_threshold_quarantine}"
+                ),
+            }
+            return _log_and_return(decision_payload)
 
         # Refine with anomaly and synthetic signals
-        # Escalate moderate risk if anomaly is very high
+        # Escalate moderate risk if anomaly is very high (lower score = more anomalous)
         if risk_score < risk_threshold_quarantine and anomaly_score < (anomaly_threshold / 2):
             triggered_rules.append("ANOMALY_HIGH_RISK")
             reason_codes.append("ANOMALY_HIGH_RISK")
-            return {
+            return _log_and_return({
                 "decision": "QUARANTINE",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Moderate risk ({risk_score:.1f}) but extremely anomalous pattern (anomaly: {anomaly_score:.1f})",
-            }
+            })
 
-        # Escalate if synthetic + low identity + first seen
+        # Escalate if synthetic + low identity + first seen (higher synthetic_likelihood = more synthetic)
         if (
             synthetic_likelihood >= synthetic_threshold
             and identity_confidence < 40
@@ -163,71 +228,75 @@ class PolicyEngine:
         ):
             triggered_rules.append("SYNTHETIC_LIKELY_FIRST_SEEN")
             reason_codes.append("SYNTHETIC_LIKELY_FIRST_SEEN")
-            return {
+            return _log_and_return({
                 "decision": "QUARANTINE",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Synthetic content likely (score: {synthetic_likelihood:.1f}) with low identity confidence ({identity_confidence:.1f}) and no prior sightings",
-            }
+            })
 
         # Assurance-based allow
         assurance_threshold_allow = thresholds.get("assurance_threshold_allow", 80)
         if assurance_score >= assurance_threshold_allow and risk_score < risk_threshold_review:
             triggered_rules.append("ASSURANCE_THRESHOLD_ALLOW")
             reason_codes.append("HIGH_ASSURANCE")
-            return {
+            return _log_and_return({
                 "decision": "ALLOW",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Assurance score {assurance_score:.1f} meets allow threshold with low risk",
-            }
+            })
 
         # Identity confidence checks
         if identity_confidence < 30:
             triggered_rules.append("LOW_IDENTITY_CONFIDENCE")
             reason_codes.append("NEW_IDENTITY")
-            return {
+            return _log_and_return({
                 "decision": "REVIEW",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Low identity confidence {identity_confidence:.1f} requires review",
-            }
+            })
 
         # Anomaly checks (moderate anomaly)
         if anomaly_score < anomaly_threshold:
             triggered_rules.append("HIGH_ANOMALY")
             reason_codes.append("ANOMALOUS_PATTERN")
-            return {
+            return _log_and_return({
                 "decision": "REVIEW",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Anomaly score {anomaly_score:.1f} indicates unusual pattern",
-            }
+            })
 
         # Synthetic/AI disclosure (moderate synthetic likelihood)
         if synthetic_likelihood >= synthetic_threshold:
             triggered_rules.append("SYNTHETIC_LIKELIHOOD")
             reason_codes.append("AI_DISCLOSURE_REQUIRED")
-            return {
+            return _log_and_return({
                 "decision": "REVIEW",
                 "policy_version": policy.version,
                 "triggered_rules": triggered_rules,
                 "reason_codes": reason_codes,
                 "rationale": f"Synthetic likelihood {synthetic_likelihood:.1f} requires AI disclosure review",
-            }
+            })
 
         # Default: REVIEW for anything that doesn't meet clear criteria
         triggered_rules.append("DEFAULT_REVIEW")
         reason_codes.append("REQUIRES_MANUAL_REVIEW")
-        return {
+        decision_payload = {
             "decision": "REVIEW",
             "policy_version": policy.version,
             "triggered_rules": triggered_rules,
             "reason_codes": reason_codes,
-            "rationale": "Content requires manual review",
+            "rationale": (
+                "Default review fallback when no explicit allow or block rule fired. "
+                "This should be rare and indicates an unclassified combination of signals."
+            ),
         }
+        return _log_and_return(decision_payload)
 
