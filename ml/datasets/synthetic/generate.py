@@ -90,6 +90,16 @@ def generate_synthetic_dataset(n_samples: int = 1000, output_path: str = "synthe
             label = "REJECT"
         elif risk_score > 70 or prior_quarantine_count > 0:
             label = "QUARANTINE"
+        # Bias benign new users toward ALLOW (80%) vs REVIEW (20%)
+        elif (
+            profile_name == "new_user"
+            and prior_quarantine_count == 0
+            and prior_sightings_count <= 1
+            and upload_velocity < 5
+            and risk_score < 50
+            and assurance_score >= 50
+        ):
+            label = "ALLOW" if random.random() < 0.8 else "REVIEW"
         elif risk_score > 40 or identity_confidence < 30:
             label = "REVIEW"
         elif is_clean and assurance_score > 70:

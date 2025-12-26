@@ -178,6 +178,8 @@ async def ingest(
         upload_velocity=upload_velocity_24h,
         prior_sightings_count=prior_sightings_count,
     )
+    primary_label = risk_signals.get("primary_label")
+    class_probabilities = risk_signals.get("class_probabilities", {})
 
     # Step 9: Policy Evaluation
     policy_engine = PolicyEngine(db)
@@ -191,6 +193,8 @@ async def ingest(
         has_prior_reject=pvid_result["sightings"]["has_prior_reject"],
         prior_sightings_count=pvid_result["sightings"]["prior_sightings_count"],
         identity_confidence=identity_confidence,
+        primary_label=primary_label,
+        class_probabilities=class_probabilities,
     )
 
     ml_signals = {
@@ -205,6 +209,8 @@ async def ingest(
         "prior_quarantine_count": prior_quarantine_count,
         "has_prior_quarantine": pvid_result["sightings"]["has_prior_quarantine"],
         "has_prior_reject": pvid_result["sightings"]["has_prior_reject"],
+        "primary_label": primary_label,
+        "class_probabilities": class_probabilities,
     }
 
     # Create upload record
@@ -227,8 +233,11 @@ async def ingest(
     db.add(upload)
     db.flush()
 
-    # Store risk signals
+    # Store risk signals (only numeric values; primary_label and class_probabilities are in ml_signals)
     for signal_type, value in risk_signals.items():
+        # Skip non-numeric values (primary_label is str, class_probabilities is dict)
+        if not isinstance(value, (int, float)):
+            continue
         signal = RiskSignal(
             tenant_id=tenant.id,
             upload_id=upload.id,

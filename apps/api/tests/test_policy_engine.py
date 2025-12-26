@@ -217,7 +217,107 @@ class TestPolicyEngine:
         )
 
         assert result["decision"] == "REVIEW"
-        assert "DEFAULT_REVIEW" in result["triggered_rules"]
+        assert "DEFAULT_REVIEW_BASELINE" in result["triggered_rules"]
         assert "REQUIRES_MANUAL_REVIEW" in result["reason_codes"]
+
+    def test_label_first_allow_primary(self):
+        """Label-first mode should allow when model primary is ALLOW and no guardrails fire."""
+        db = Mock()
+        engine = PolicyEngine(db)
+
+        mock_policy = Mock()
+        mock_policy.version = "ORIGIN-CORE-v1.0"
+        mock_policy.thresholds_json = {
+            "risk_threshold_review": 40,
+            "risk_threshold_quarantine": 70,
+            "risk_threshold_reject": 90,
+            "anomaly_threshold": 30,
+            "synthetic_threshold": 70,
+        }
+        mock_policy.decision_mode = "label_first"
+        engine.get_policy_profile = Mock(return_value=mock_policy)
+
+        result = engine.evaluate_decision(
+            tenant_id=1,
+            risk_score=20.0,
+            assurance_score=90.0,
+            anomaly_score=60.0,
+            synthetic_likelihood=20.0,
+            has_prior_quarantine=False,
+            has_prior_reject=False,
+            prior_sightings_count=2,
+            identity_confidence=80.0,
+            primary_label="ALLOW",
+            class_probabilities={"ALLOW": 0.8, "REVIEW": 0.1, "QUARANTINE": 0.05, "REJECT": 0.05},
+        )
+
+        assert result["decision"] == "ALLOW"
+        assert "MODEL_PRIMARY_LABEL_ALLOW" in result["reason_codes"]
+        assert "MODEL_PRIMARY_LABEL" in result["triggered_rules"]
+
+    def test_label_first_review_primary(self):
+        """Label-first mode should honor REVIEW primary when no guardrails fire."""
+        db = Mock()
+        engine = PolicyEngine(db)
+
+        mock_policy = Mock()
+        mock_policy.version = "ORIGIN-CORE-v1.0"
+        mock_policy.thresholds_json = {
+            "risk_threshold_review": 40,
+            "risk_threshold_quarantine": 70,
+            "risk_threshold_reject": 90,
+        }
+        mock_policy.decision_mode = "label_first"
+        engine.get_policy_profile = Mock(return_value=mock_policy)
+
+        result = engine.evaluate_decision(
+            tenant_id=1,
+            risk_score=55.0,
+            assurance_score=60.0,
+            anomaly_score=60.0,
+            synthetic_likelihood=20.0,
+            has_prior_quarantine=False,
+            has_prior_reject=False,
+            prior_sightings_count=1,
+            identity_confidence=60.0,
+            primary_label="REVIEW",
+            class_probabilities={"ALLOW": 0.2, "REVIEW": 0.6, "QUARANTINE": 0.1, "REJECT": 0.1},
+        )
+
+        assert result["decision"] == "REVIEW"
+        assert "MODEL_PRIMARY_LABEL_REVIEW" in result["reason_codes"]
+
+    def test_label_first_guardrail_prior_reject(self):
+        """Guardrail should override label-first ALLOW when prior reject exists."""
+        db = Mock()
+        engine = PolicyEngine(db)
+
+        mock_policy = Mock()
+        mock_policy.version = "ORIGIN-CORE-v1.0"
+        mock_policy.thresholds_json = {
+            "risk_threshold_review": 40,
+            "risk_threshold_quarantine": 70,
+            "risk_threshold_reject": 90,
+        }
+        mock_policy.decision_mode = "label_first"
+        engine.get_policy_profile = Mock(return_value=mock_policy)
+
+        result = engine.evaluate_decision(
+            tenant_id=1,
+            risk_score=20.0,
+            assurance_score=85.0,
+            anomaly_score=70.0,
+            synthetic_likelihood=10.0,
+            has_prior_quarantine=False,
+            has_prior_reject=True,
+            prior_sightings_count=5,
+            identity_confidence=90.0,
+            primary_label="ALLOW",
+            class_probabilities={"ALLOW": 0.9, "REVIEW": 0.05, "QUARANTINE": 0.03, "REJECT": 0.02},
+        )
+
+        assert result["decision"] == "REJECT"
+        assert "PRIOR_REJECT_HISTORY" in result["reason_codes"]
+        assert "GUARDRAIL_PRIOR_REJECT" in result["triggered_rules"]
 
 

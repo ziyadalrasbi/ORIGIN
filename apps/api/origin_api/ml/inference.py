@@ -1,12 +1,21 @@
-"""ML inference service for risk signals."""
+"""ML inference service for risk signals.
+
+Returns model-driven risk signals plus explainability metadata:
+- risk_score: probability-weighted severity on 0-100
+- assurance_score: confidence derived from class probability entropy (0-100)
+- anomaly_score: 0-100 (lower = more anomalous)
+- synthetic_likelihood: heuristic 0-100 likelihood of synthetic/AI
+- primary_label: highest-probability class from the risk model
+- class_probabilities: mapping of label -> probability
+"""
 
 import logging
-
-import joblib
-import numpy as np
+import math
 from pathlib import Path
 from typing import Optional
 
+import joblib
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -68,14 +77,14 @@ class MLInferenceService:
     ) -> dict:
         """
         Compute risk signals from features.
-        
-        Uses trained ML models to compute:
-        - risk_score: 0-100, weighted average of decision class probabilities
-        - assurance_score: 0-100, confidence that content is legitimate
+
+        Returns a dict containing:
+        - risk_score: 0-100, probability-weighted severity (higher = riskier)
+        - assurance_score: 0-100, confidence derived from class-probability entropy (higher = more confident/legitimate)
         - anomaly_score: 0-100, lower = more anomalous (trained on ALLOW data)
-        - synthetic_likelihood: 0-100, likelihood content is AI-generated
-        
-        Returns dict with all signal scores.
+        - synthetic_likelihood: 0-100, heuristic likelihood content is AI-generated
+        - primary_label: highest-probability class predicted by the risk model
+        - class_probabilities: mapping label -> probability (floats)
         """
         # Prepare feature vector
         features = np.array([[
@@ -87,12 +96,22 @@ class MLInferenceService:
             prior_sightings_count,
         ]])
 
+        primary_label = "REVIEW"
+        class_probabilities = {}
+
         # Risk score (0-100)
         if not self.risk_model or not self.risk_label_encoder:
             logger.warning("Risk model or label encoder missing, using fallback heuristics")
             risk_score = self._fallback_risk_score(
                 account_age_days, prior_quarantine_count, identity_confidence
             )
+            # Pseudo-probabilities for fallback
+            class_probabilities = {
+                "ALLOW": 0.2,
+                "REVIEW": 0.6,
+                "QUARANTINE": 0.15,
+                "REJECT": 0.05,
+            }
         else:
             try:
                 # Get probability predictions
@@ -120,45 +139,81 @@ class MLInferenceService:
                             account_age_days, prior_quarantine_count, identity_confidence
                         )
                     else:
-                        # Define severity map
+                        # Build label list and probabilities
+                        labels = list(classes)
+                        class_probabilities = {
+                            label: float(prob) for label, prob in zip(labels, probs)
+                        }
+                        # Primary label from highest probability
+                        primary_idx = int(np.argmax(probs))
+                        primary_label = labels[primary_idx]
+
+                        # Define severity map (label-driven)
                         severity_map = {
-                            "ALLOW": 0,
-                            "REVIEW": 30,
-                            "QUARANTINE": 70,
+                            "ALLOW": 5,
+                            "REVIEW": 40,
+                            "QUARANTINE": 75,
                             "REJECT": 90,
                         }
-                        
-                        # Compute risk_score via weighted sum over labels
-                        risk_score = 0.0
-                        unexpected_labels = []
-                        for p, label in zip(probs, classes):
-                            severity = severity_map.get(label, None)
-                            if severity is None:
-                                unexpected_labels.append(label)
-                                severity = 50.0  # default mid-risk if unexpected label
-                            risk_score += p * severity
-                        
-                        if unexpected_labels:
-                            logger.warning(
-                                f"Unexpected labels in model output: {unexpected_labels}. "
-                                "Using default severity (50) for these labels."
+
+                        risk_score = float(
+                            sum(
+                                float(probs[i]) * severity_map.get(labels[i], 40.0)
+                                for i in range(len(labels))
                             )
+                        )
+
+                        # Assurance score from entropy-based confidence
+                        eps = 1e-8
+                        num_classes = len(labels)
+                        entropy = -sum(float(p) * math.log(float(p) + eps) for p in probs)
+                        max_entropy = math.log(num_classes) if num_classes > 0 else 1.0
+                        confidence = 1.0 - min(1.0, entropy / max_entropy) if max_entropy > 0 else 0.0
+                        assurance_score = float(max(0.0, min(100.0, confidence * 100.0)))
             except Exception as e:
                 logger.exception("Error in risk model inference")
                 risk_score = self._fallback_risk_score(
                     account_age_days, prior_quarantine_count, identity_confidence
                 )
+                assurance_score = max(
+                    0,
+                    min(
+                        100,
+                        identity_confidence * 0.6
+                        + (100 - risk_score) * 0.4
+                        - (prior_quarantine_count * 15),
+                    ),
+                )
+                if not class_probabilities:
+                    class_probabilities = {
+                        "ALLOW": 0.25,
+                        "REVIEW": 0.5,
+                        "QUARANTINE": 0.2,
+                        "REJECT": 0.05,
+                    }
+        if not class_probabilities:
+            # Fallback assurance if not set above
+            assurance_score = max(
+                0,
+                min(
+                    100,
+                    identity_confidence * 0.6
+                    + (100 - risk_score) * 0.4
+                    - (prior_quarantine_count * 15),
+                ),
+            )
 
-        # Assurance score (0-100) - confidence it's legitimate
-        assurance_score = max(
-            0,
-            min(
-                100,
-                identity_confidence * 0.6
-                + (100 - risk_score) * 0.4
-                - (prior_quarantine_count * 15),
-            ),
-        )
+        # Assurance score (0-100) - derived from probability entropy when available, otherwise fallback heuristic
+        if "assurance_score" not in locals():
+            assurance_score = max(
+                0,
+                min(
+                    100,
+                    identity_confidence * 0.6
+                    + (100 - risk_score) * 0.4
+                    - (prior_quarantine_count * 15),
+                ),
+            )
 
         # Anomaly score (0-100)
         if not self.anomaly_model:
@@ -183,6 +238,8 @@ class MLInferenceService:
             "assurance_score": float(assurance_score),
             "anomaly_score": float(anomaly_score),
             "synthetic_likelihood": float(synthetic_likelihood),
+            "primary_label": primary_label,
+            "class_probabilities": class_probabilities,
         }
 
     def _fallback_risk_score(

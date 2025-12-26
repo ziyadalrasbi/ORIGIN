@@ -39,6 +39,9 @@ def test_ingest_basic(api_key):
     assert "ml_signals" in data
     assert "risk_score" in data["ml_signals"]
     assert "assurance_score" in data["ml_signals"]
+    assert "primary_label" in data["ml_signals"]
+    assert "class_probabilities" in data["ml_signals"]
+    assert isinstance(data["ml_signals"]["class_probabilities"], dict)
 
 
 def test_ingest_missing_api_key():

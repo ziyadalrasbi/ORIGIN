@@ -21,6 +21,7 @@ class PolicyProfile(Base):
     thresholds_json = Column(JSON, nullable=True)  # Risk thresholds, assurance thresholds, etc.
     weights_json = Column(JSON, nullable=True)  # Feature weights for policy rules
     ruleset_ref = Column(String(255), nullable=True)  # Reference to policy ruleset (OPA bundle or JSON)
+    decision_mode = Column(String(50), nullable=False, server_default="score_first")  # score_first | label_first
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

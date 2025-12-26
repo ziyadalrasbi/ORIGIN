@@ -63,6 +63,7 @@ def seed_tenants(db: Session):
                 "synthetic_threshold": 70,
             },
             weights_json={},
+            decision_mode="score_first",
             is_active=True,
         )
         db.add(policy_profile)
@@ -107,6 +108,7 @@ def seed_tenants(db: Session):
                 "synthetic_threshold": 70,
             },
             weights_json={},
+            decision_mode="score_first",
             is_active=True,
         )
         db.add(policy_profile)

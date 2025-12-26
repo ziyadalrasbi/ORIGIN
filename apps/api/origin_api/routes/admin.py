@@ -87,6 +87,7 @@ async def create_tenant(
             "synthetic_threshold": 70,
         },
         weights_json={},
+        decision_mode="score_first",
         is_active=True,
     )
     db.add(policy_profile)
