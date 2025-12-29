@@ -196,6 +196,9 @@ async def ingest(
         primary_label=primary_label,
         class_probabilities=class_probabilities,
     )
+    
+    # Get policy profile for ledger outputs (used by EvidencePackV2)
+    policy_profile = policy_engine.get_policy_profile(tenant.id)
 
     ml_signals = {
         "risk_score": risk_signals["risk_score"],
@@ -259,6 +262,8 @@ async def ingest(
         "fingerprints": request_data.fingerprints,
     }
 
+    # Prepare outputs for certificate and ledger
+    # These fields are used by EvidencePackV2 to support AI-Act/DSA-aligned evidence generation
     outputs = {
         "decision": decision_result["decision"],
         "risk_score": risk_signals["risk_score"],
@@ -267,6 +272,13 @@ async def ingest(
         "reason_codes": decision_result["reason_codes"],
         "rationale": decision_result.get("rationale"),
         "ml_signals": ml_signals,
+        # Policy profile information for regulatory compliance tracking
+        "policy_profile_id": policy_profile.id if policy_profile else None,
+        "policy_regulatory_compliance_json": (
+            policy_profile.regulatory_compliance_json
+            if policy_profile and policy_profile.regulatory_compliance_json
+            else None
+        ),
     }
 
     # Append ledger event

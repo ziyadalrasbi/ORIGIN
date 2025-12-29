@@ -1,7 +1,7 @@
 """Evidence pack generation service."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -19,8 +19,23 @@ from reportlab.platypus import (
     PageBreak,
     KeepTogether,
 )
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from origin_api.evidence.schema import (
+    EvidencePackV2,
+    TenantContext,
+    CertificateContext,
+    UploadContext,
+    DecisionSummary,
+    MLSignalsContext,
+    RegulatoryProfile,
+    RiskImpactAnalysis,
+    IdentityHistoryContext,
+    GovernanceContext,
+    TechnicalTraceContext,
+    AuditMetadata,
+)
 from origin_api.models import (
     DecisionCertificate,
     EvidencePack,
@@ -29,6 +44,7 @@ from origin_api.models import (
     Account,
     PolicyProfile,
     RiskSignal,
+    Tenant,
 )
 from origin_api.settings import get_settings
 
@@ -172,69 +188,414 @@ class EvidencePackGenerator:
             "ledger_event": ledger_event,
         }
 
-    def generate_json(self, certificate: DecisionCertificate, upload: Upload) -> dict:
-        """Generate comprehensive JSON evidence pack."""
+    def generate_json(
+        self, certificate: DecisionCertificate, upload: Upload, audience: str = "INTERNAL"
+    ) -> dict:
+        """Generate comprehensive JSON evidence pack (Evidence Pack v2).
+
+        Returns a dict that conforms to EvidencePackV2 schema while maintaining
+        backward compatibility with existing top-level keys.
+        """
         data = self._gather_evidence_data(certificate, upload)
+        decision_trace = data["decision_trace"]
+        ml_signals = decision_trace.get("ml_signals", {})
 
-        evidence = {
-            "certificate_id": certificate.certificate_id,
-            "issued_at": certificate.issued_at.isoformat(),
-            "decision": upload.decision,
-            "decision_explanation": self._get_decision_explanation(
-                upload.decision, data["decision_trace"].get("rationale")
-            ),
-            "policy_version": certificate.policy_version,
-            "policy_profile": {
-                "name": data["policy_profile"].name if data["policy_profile"] else None,
-                "version": data["policy_profile"].version if data["policy_profile"] else None,
-                "decision_mode": (
-                    data["policy_profile"].decision_mode if data["policy_profile"] else None
-                ),
-                "thresholds": (
-                    data["policy_profile"].thresholds_json if data["policy_profile"] else {}
-                ),
-                "regulatory_compliance": (
-                    data["policy_profile"].regulatory_compliance_json
-                    if data["policy_profile"]
-                    else {}
-                ),
-            },
-            "upload": {
-                "ingestion_id": upload.ingestion_id,
-                "external_id": upload.external_id,
-                "title": upload.title,
-                "content_ref": upload.content_ref,
-                "metadata": upload.metadata_json or {},
-                "fingerprints": upload.fingerprints_json or {},
-                "received_at": upload.received_at.isoformat(),
-                "pvid": upload.pvid,
-            },
-            "account": {
-                "external_id": data["account"].external_id if data["account"] else None,
-                "type": data["account"].type if data["account"] else None,
-                "display_name": data["account"].display_name if data["account"] else None,
-                "risk_state": data["account"].risk_state if data["account"] else None,
-                "created_at": (
-                    data["account"].created_at.isoformat() if data["account"] and data["account"].created_at else None
-                ),
-            },
-            "scores": {
-                "risk_score": float(upload.risk_score) if upload.risk_score else None,
-                "assurance_score": float(upload.assurance_score) if upload.assurance_score else None,
-            },
-            "risk_signals": data["risk_signals"],
-            "decision_trace": data["decision_trace"],
-            "integrity": {
-                "inputs_hash": certificate.inputs_hash,
-                "outputs_hash": certificate.outputs_hash,
-                "ledger_hash": certificate.ledger_hash,
-                "signature": certificate.signature,
-            },
+        # Get tenant
+        tenant = self.db.query(Tenant).filter(Tenant.id == upload.tenant_id).first()
+
+        # Build EvidencePackV2
+        evidence_v2 = self._build_evidence_pack_v2(
+            certificate, upload, data, tenant, ml_signals, audience
+        )
+
+        # Convert to dict for backward compatibility
+        evidence_dict = evidence_v2.model_dump(mode="json")
+
+        # Preserve existing top-level keys for backward compatibility
+        evidence_dict["certificate_id"] = certificate.certificate_id
+        evidence_dict["issued_at"] = certificate.issued_at.isoformat()
+        evidence_dict["decision"] = upload.decision
+        evidence_dict["decision_explanation"] = self._get_decision_explanation(
+            upload.decision, decision_trace.get("rationale")
+        )
+        evidence_dict["policy_version"] = certificate.policy_version
+        evidence_dict["scores"] = {
+            "risk_score": float(upload.risk_score) if upload.risk_score else None,
+            "assurance_score": float(upload.assurance_score) if upload.assurance_score else None,
         }
-        return evidence
+        evidence_dict["risk_signals"] = data["risk_signals"]
+        evidence_dict["decision_trace"] = decision_trace
+        evidence_dict["integrity"] = {
+            "inputs_hash": certificate.inputs_hash,
+            "outputs_hash": certificate.outputs_hash,
+            "ledger_hash": certificate.ledger_hash,
+            "signature": certificate.signature,
+        }
 
-    def generate_pdf(self, certificate: DecisionCertificate, upload: Upload) -> bytes:
-        """Generate professionally styled PDF evidence pack."""
+        return evidence_dict
+
+    def _build_evidence_pack_v2(
+        self,
+        certificate: DecisionCertificate,
+        upload: Upload,
+        data: dict,
+        tenant: Optional[Tenant],
+        ml_signals: dict,
+        audience: str,
+    ) -> EvidencePackV2:
+        """Build EvidencePackV2 instance from gathered data."""
+        decision_trace = data["decision_trace"]
+        policy_profile = data["policy_profile"]
+        account = data["account"]
+        ledger_event = data["ledger_event"]
+
+        # Tenant Context
+        tenant_context = TenantContext(
+            tenant_id=upload.tenant_id,
+            tenant_name=tenant.label if tenant else None,
+            jurisdiction=["UNKNOWN"],  # Placeholder - can be populated from tenant metadata later
+        )
+
+        # Certificate Context
+        certificate_context = CertificateContext(
+            certificate_id=certificate.certificate_id,
+            issued_at=certificate.issued_at,
+            policy_version=certificate.policy_version,
+            inputs_hash=certificate.inputs_hash,
+            outputs_hash=certificate.outputs_hash,
+            ledger_hash=certificate.ledger_hash,
+            signature=certificate.signature,
+            signature_algorithm="RSA-PSS-SHA256",
+            key_fingerprint=None,  # Can be populated from certificate metadata
+        )
+
+        # Upload Context
+        upload_context = UploadContext(
+            ingestion_id=upload.ingestion_id,
+            external_id=upload.external_id,
+            received_at=upload.received_at,
+            pvid=upload.pvid,
+            metadata_json=upload.metadata_json,
+            content_ref=upload.content_ref,
+            account_id=upload.account_id,
+            account_type=account.type if account else None,
+            account_created_at=account.created_at if account and account.created_at else None,
+        )
+
+        # Decision Summary
+        decision_mode = (
+            policy_profile.decision_mode if policy_profile and policy_profile.decision_mode else "AUTO"
+        )
+        human_review_required = upload.decision in ["REVIEW", "QUARANTINE", "REJECT"]
+        sla_guidance = (
+            "60-minute review target for REVIEW decisions"
+            if upload.decision == "REVIEW"
+            else None
+        )
+
+        decision_summary = DecisionSummary(
+            decision=upload.decision,
+            decision_mode=decision_mode,
+            decision_rationale=decision_trace.get("rationale"),
+            reasons=decision_trace.get("reason_codes", []),  # Legacy field
+            reason_codes=decision_trace.get("reason_codes", []),
+            triggered_rules=decision_trace.get("triggered_rules", []),
+            human_review_required=human_review_required,
+            sla_guidance=sla_guidance,
+        )
+
+        # ML Signals Context
+        risk_score = float(upload.risk_score) if upload.risk_score else 0.0
+        assurance_score = float(upload.assurance_score) if upload.assurance_score else 0.0
+
+        # Build feature contributions (simplified)
+        feature_contributions = []
+        if upload.account_id and account and account.created_at:
+            account_age_days = (upload.received_at - account.created_at).days
+            if account_age_days < 7:
+                feature_contributions.append({
+                    "feature": "account_age_days",
+                    "direction": "negative",
+                    "explanation": f"New account ({account_age_days} days old) increases risk",
+                })
+            elif account_age_days > 365:
+                feature_contributions.append({
+                    "feature": "account_age_days",
+                    "direction": "positive",
+                    "explanation": f"Established account ({account_age_days} days old) reduces risk",
+                })
+
+        if ml_signals.get("prior_quarantine_count", 0) > 0:
+            feature_contributions.append({
+                "feature": "prior_quarantine_count",
+                "direction": "negative",
+                "explanation": f"Prior quarantine history ({ml_signals.get('prior_quarantine_count')} instances) increases risk",
+            })
+
+        ml_signals_context = MLSignalsContext(
+            risk_score=risk_score,
+            assurance_score=assurance_score,
+            anomaly_score=ml_signals.get("anomaly_score"),
+            synthetic_likelihood=ml_signals.get("synthetic_likelihood"),
+            identity_confidence=ml_signals.get("identity_confidence"),
+            prior_sightings_count=ml_signals.get("prior_sightings_count"),
+            prior_quarantine_count=ml_signals.get("prior_quarantine_count"),
+            has_prior_quarantine=ml_signals.get("has_prior_quarantine", False),
+            has_prior_reject=ml_signals.get("has_prior_reject", False),
+            primary_label=ml_signals.get("primary_label"),
+            class_probabilities=ml_signals.get("class_probabilities"),
+            feature_contributions=feature_contributions,
+            model_metadata={},  # Can be populated from ML inference service metadata
+        )
+
+        # Regulatory Profile
+        regulatory_compliance = (
+            policy_profile.regulatory_compliance_json
+            if policy_profile and policy_profile.regulatory_compliance_json
+            else {}
+        )
+
+        control_objectives = []
+        if regulatory_compliance:
+            for regime, articles in regulatory_compliance.items():
+                for article_key, description in articles.items():
+                    control_objectives.append({
+                        "regime": regime.upper(),
+                        "article": article_key,
+                        "status": "SUPPORTED_FOR_DEPLOYER",
+                        "description": description,
+                    })
+        else:
+            # Default control objectives
+            control_objectives = [
+                {
+                    "regime": "EU_AI_ACT",
+                    "article": "12",
+                    "status": "SUPPORTED_FOR_DEPLOYER",
+                    "description": "Logging and transparency for high-risk AI systems",
+                },
+                {
+                    "regime": "EU_AI_ACT",
+                    "article": "13",
+                    "status": "SUPPORTED_FOR_DEPLOYER",
+                    "description": "Transparency obligations for AI systems",
+                },
+                {
+                    "regime": "EU_DSA",
+                    "article": "14",
+                    "status": "SUPPORTED_FOR_DEPLOYER",
+                    "description": "Systemic risk assessment and mitigation",
+                },
+            ]
+
+        systemic_risk_tags = []
+        if ml_signals.get("synthetic_likelihood", 0) > 60:
+            systemic_risk_tags.append("SYNTHETIC_CONTENT")
+        if ml_signals.get("has_prior_quarantine", False):
+            systemic_risk_tags.append("IDENTITY_FRAUD")
+        if ml_signals.get("identity_confidence", 100) < 40:
+            systemic_risk_tags.append("LOW_IDENTITY_CONFIDENCE")
+
+        regulatory_profile = RegulatoryProfile(
+            applicable_regimes=["EU_AI_ACT", "EU_DSA"],
+            control_objectives=control_objectives,
+            systemic_risk_tags=systemic_risk_tags,
+        )
+
+        # Risk Impact Analysis
+        risk_band = self._compute_risk_band(risk_score, policy_profile)
+        false_positive_risk, false_negative_risk, expected_harm = self._assess_risk_impact(
+            upload.decision, risk_band
+        )
+
+        # Build counterfactuals (simplified - without re-running policy engine)
+        counterfactuals = []
+        if risk_score > 0:
+            counterfactual_lower = {
+                "scenario": f"risk_score -10 (hypothetical: {risk_score - 10:.1f})",
+                "decision": "ALLOW" if risk_score - 10 < 40 else "REVIEW",
+                "rationale": "Lower risk score would result in less restrictive decision",
+            }
+            counterfactuals.append(counterfactual_lower)
+
+        risk_impact_analysis = RiskImpactAnalysis(
+            risk_band=risk_band,
+            false_positive_risk=false_positive_risk,
+            false_negative_risk=false_negative_risk,
+            expected_harm_if_misclassified=expected_harm,
+            counterfactuals=counterfactuals,
+        )
+
+        # Identity and History Context
+        historical_consistency = self._compute_historical_consistency(upload)
+
+        identity_history_context = IdentityHistoryContext(
+            identity_confidence=ml_signals.get("identity_confidence"),
+            shared_device_count=ml_signals.get("shared_device_count"),
+            relationship_count=ml_signals.get("relationship_count"),
+            prior_quarantine_count=ml_signals.get("prior_quarantine_count"),
+            cross_tenant_signals=ml_signals.get("cross_tenant_signals"),
+            historical_consistency=historical_consistency,
+        )
+
+        # Governance Context
+        governance_context = GovernanceContext(
+            policy_profile_id=policy_profile.id if policy_profile else None,
+            policy_name=policy_profile.name if policy_profile else None,
+            policy_last_updated_at=policy_profile.updated_at if policy_profile else None,
+            policy_owner=None,  # Can be populated from policy_profile metadata
+            human_oversight={
+                "required": human_review_required,
+                "recommended_role": "content_moderator",
+            },
+        )
+
+        # Technical Trace Context
+        ledger_event_data = {}
+        if ledger_event:
+            ledger_event_data = {
+                "event_hash": ledger_event.event_hash,
+                "previous_event_hash": ledger_event.previous_event_hash,
+                "event_type": ledger_event.event_type,
+                "timestamp": ledger_event.created_at.isoformat() if ledger_event.created_at else None,
+            }
+
+        certificate_data = {
+            "inputs_hash": certificate.inputs_hash,
+            "outputs_hash": certificate.outputs_hash,
+            "signature": certificate.signature,
+            "algorithm": "RSA-PSS-SHA256",
+            "key_fingerprint": None,
+        }
+
+        verification_guidance = (
+            "To verify this certificate:\n"
+            "1. Verify ledger hash chain: check previous_event_hash links to previous event\n"
+            "2. Verify certificate signature: use public key to verify signature\n"
+            "3. Verify inputs/outputs hashes match certificate data"
+        )
+
+        technical_trace_context = TechnicalTraceContext(
+            ledger_event=ledger_event_data,
+            certificate_data=certificate_data,
+            verification_guidance=verification_guidance,
+        )
+
+        # Audit Metadata
+        audit_metadata = AuditMetadata(
+            generated_at=datetime.utcnow(),
+            generated_by_version=f"origin-api@{settings.environment}",
+            audience=audience,
+            redactions={},  # Can be populated based on audience
+        )
+
+        # Build EvidencePackV2
+        return EvidencePackV2(
+            version="origin-evidence-v2",
+            tenant=tenant_context,
+            certificate=certificate_context,
+            upload=upload_context,
+            decision_summary=decision_summary,
+            ml_and_signals=ml_signals_context,
+            regulatory_profile=regulatory_profile,
+            risk_impact_analysis=risk_impact_analysis,
+            identity_and_history=identity_history_context,
+            governance_and_accountability=governance_context,
+            technical_trace_and_ledger=technical_trace_context,
+            audit_metadata=audit_metadata,
+        )
+
+    def _compute_risk_band(self, risk_score: float, policy_profile: Optional[PolicyProfile]) -> str:
+        """Compute risk band from risk score and policy thresholds."""
+        if not policy_profile or not policy_profile.thresholds_json:
+            # Default thresholds
+            if risk_score >= 90:
+                return "CRITICAL"
+            elif risk_score >= 70:
+                return "HIGH"
+            elif risk_score >= 40:
+                return "MEDIUM"
+            else:
+                return "LOW"
+
+        thresholds = policy_profile.thresholds_json
+        reject_threshold = thresholds.get("risk_threshold_reject", 90)
+        quarantine_threshold = thresholds.get("risk_threshold_quarantine", 70)
+        review_threshold = thresholds.get("risk_threshold_review", 40)
+
+        if risk_score >= reject_threshold:
+            return "CRITICAL"
+        elif risk_score >= quarantine_threshold:
+            return "HIGH"
+        elif risk_score >= review_threshold:
+            return "MEDIUM"
+        else:
+            return "LOW"
+
+    def _assess_risk_impact(
+        self, decision: str, risk_band: str
+    ) -> tuple[str, str, Optional[str]]:
+        """Assess false positive/negative risk and expected harm."""
+        if decision == "ALLOW":
+            false_positive_risk = "LOW" if risk_band == "LOW" else "MEDIUM"
+            false_negative_risk = "HIGH" if risk_band in ["HIGH", "CRITICAL"] else "MEDIUM"
+            expected_harm = (
+                "High: Allowing high-risk content could enable fraud or policy violations"
+                if risk_band in ["HIGH", "CRITICAL"]
+                else "Low: Low-risk content unlikely to cause harm"
+            )
+        elif decision == "REJECT":
+            false_positive_risk = "HIGH" if risk_band == "LOW" else "MEDIUM"
+            false_negative_risk = "LOW"
+            expected_harm = (
+                "High: Rejecting legitimate content could harm creator reputation"
+                if risk_band == "LOW"
+                else "Low: Rejecting high-risk content prevents harm"
+            )
+        else:  # REVIEW, QUARANTINE
+            false_positive_risk = "MEDIUM"
+            false_negative_risk = "MEDIUM"
+            expected_harm = "Moderate: Requires human review to assess actual risk"
+
+        return false_positive_risk, false_negative_risk, expected_harm
+
+    def _compute_historical_consistency(self, upload: Upload) -> Optional[dict]:
+        """Compute historical consistency for account/PVID."""
+        if not upload.account_id and not upload.pvid:
+            return None
+
+        # Query last 90 days
+        window_start = upload.received_at - timedelta(days=90)
+
+        query = self.db.query(Upload.decision, func.count(Upload.id).label("count"))
+        query = query.filter(
+            Upload.tenant_id == upload.tenant_id,
+            Upload.received_at >= window_start,
+            Upload.id != upload.id,  # Exclude current upload
+        )
+
+        if upload.account_id:
+            query = query.filter(Upload.account_id == upload.account_id)
+        elif upload.pvid:
+            query = query.filter(Upload.pvid == upload.pvid)
+
+        results = query.group_by(Upload.decision).all()
+
+        decision_counts = {decision: count for decision, count in results}
+
+        return {
+            "last_90_days": decision_counts,
+            "total_decisions": sum(decision_counts.values()),
+        }
+
+    def generate_pdf(
+        self, certificate: DecisionCertificate, upload: Upload, evidence_json: Optional[dict] = None
+    ) -> bytes:
+        """Generate professionally styled PDF evidence pack (Evidence Pack v2).
+
+        Uses EvidencePackV2 schema to enrich PDF with regulatory compliance information.
+        Preserves existing sections for backward compatibility.
+        """
         from io import BytesIO
 
         buffer = BytesIO()
@@ -248,6 +609,17 @@ class EvidencePackGenerator:
         )
         story = []
         styles = getSampleStyleSheet()
+
+        # Build EvidencePackV2 if not provided
+        if evidence_json is None:
+            evidence_json = self.generate_json(certificate, upload, audience="INTERNAL")
+        
+        # Parse EvidencePackV2 (may have extra fields for backward compatibility)
+        try:
+            evidence_v2 = EvidencePackV2.model_validate(evidence_json)
+        except Exception:
+            # Fallback to old structure if v2 parsing fails
+            evidence_v2 = None
 
         # Custom styles
         title_style = ParagraphStyle(
@@ -279,7 +651,7 @@ class EvidencePackGenerator:
             borderPadding=8,
         )
 
-        # Header
+        # Page 1 - Executive Summary
         story.append(Paragraph("ORIGIN Decision Certificate", title_style))
         story.append(Spacer(1, 0.1 * inch))
 
@@ -288,7 +660,7 @@ class EvidencePackGenerator:
         story.append(Paragraph(decision_text, decision_style))
         story.append(Spacer(1, 0.2 * inch))
 
-        # Gather data
+        # Gather data (for backward compatibility)
         data = self._gather_evidence_data(certificate, upload)
 
         # Create cell style for all tables
@@ -335,6 +707,26 @@ class EvidencePackGenerator:
         story.append(Paragraph("<b>Decision Explanation</b>", heading_style))
         story.append(Paragraph(explanation, styles["Normal"]))
         story.append(Spacer(1, 0.2 * inch))
+        
+        # Add EvidencePackV2 enhancements if available
+        if evidence_v2:
+            # Decision Summary with rationale
+            if evidence_v2.decision_summary.decision_rationale:
+                story.append(Paragraph("<b>Decision Rationale</b>", heading_style))
+                story.append(Paragraph(evidence_v2.decision_summary.decision_rationale, styles["Normal"]))
+                story.append(Spacer(1, 0.2 * inch))
+            
+            # Regulatory Profile (if applicable regimes present)
+            if evidence_v2.regulatory_profile.applicable_regimes:
+                story.append(Paragraph("<b>Regulatory Compliance</b>", heading_style))
+                regimes_text = ", ".join(evidence_v2.regulatory_profile.applicable_regimes)
+                story.append(Paragraph(f"Applicable Regimes: {regimes_text}", styles["Normal"]))
+                if evidence_v2.regulatory_profile.control_objectives:
+                    story.append(Paragraph("Control Objectives:", styles["Normal"]))
+                    for obj in evidence_v2.regulatory_profile.control_objectives[:3]:  # Show first 3
+                        obj_text = f"• {obj.get('regime', '')} Art. {obj.get('article', '')}: {obj.get('description', '')[:80]}..."
+                        story.append(Paragraph(obj_text, styles["Normal"]))
+                story.append(Spacer(1, 0.2 * inch))
 
         # Upload Information
         upload_data = [

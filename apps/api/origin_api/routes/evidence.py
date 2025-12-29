@@ -94,8 +94,11 @@ async def request_evidence_pack(
     generator = EvidencePackGenerator(db)
     artifacts = {}
 
+    # Pass audience to generator (defaults to INTERNAL if not specified)
+    audience = request_data.audience or "INTERNAL"
+
     if "json" in formats:
-        artifacts["json"] = generator.generate_json(certificate, upload)
+        artifacts["json"] = generator.generate_json(certificate, upload, audience=audience)
 
     if "pdf" in formats:
         artifacts["pdf"] = generator.generate_pdf(certificate, upload)
