@@ -88,6 +88,36 @@ async def create_tenant(
         },
         weights_json={},
         decision_mode="score_first",
+        regulatory_compliance_json={
+            "DSA": {
+                "article_14": "Content moderation obligations - risk_score thresholds map to moderation tiers",
+                "article_15": "Transparency reporting - decision_rationale provides audit trail",
+                "article_16": "Risk assessment - risk_score, anomaly_score, synthetic_likelihood inform assessment",
+                "mapped_thresholds": {
+                    "risk_threshold_reject": "Article 14 - Immediate removal threshold",
+                    "risk_threshold_quarantine": "Article 14 - Restriction threshold",
+                    "risk_threshold_review": "Article 16 - Risk assessment trigger",
+                }
+            },
+            "OSA": {
+                "section_9": "Duty to assess risk - risk_score and assurance_score inform risk assessment",
+                "section_10": "Duty to prevent harm - QUARANTINE/REJECT decisions prevent harmful content",
+                "section_19": "Transparency reporting - evidence packs provide decision audit trail",
+                "mapped_thresholds": {
+                    "risk_threshold_reject": "Section 10 - Harmful content removal",
+                    "synthetic_threshold": "Section 9 - AI-generated content detection",
+                    "anomaly_threshold": "Section 9 - Anomalous behavior detection",
+                }
+            },
+            "AI_Act": {
+                "article_50": "Transparency obligations - synthetic_likelihood detects AI-generated content",
+                "article_52": "High-risk AI systems - risk_score thresholds identify high-risk content",
+                "mapped_thresholds": {
+                    "synthetic_threshold": "Article 50 - AI content disclosure threshold",
+                    "risk_threshold_quarantine": "Article 52 - High-risk content identification",
+                }
+            }
+        },
         is_active=True,
     )
     db.add(policy_profile)

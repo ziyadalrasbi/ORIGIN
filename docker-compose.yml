@@ -68,6 +68,7 @@ services:
       - ./apps/api:/app
       - ./infra:/app/infra
       - ./ml:/app/ml
+      - ./evidence_packs:/app/evidence_packs
     depends_on:
       postgres:
         condition: service_healthy
