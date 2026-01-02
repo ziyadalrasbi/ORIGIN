@@ -211,6 +211,13 @@ class EvidencePackGenerator:
         # Convert to dict for backward compatibility
         evidence_dict = evidence_v2.model_dump(mode="json")
 
+        # Apply audience-specific redactions
+        redactions = self._apply_audience_redactions(evidence_dict, audience)
+        
+        # Update audit_metadata.redactions with actual redactions performed
+        if "audit_metadata" in evidence_dict and isinstance(evidence_dict["audit_metadata"], dict):
+            evidence_dict["audit_metadata"]["redactions"] = redactions
+
         # Preserve existing top-level keys for backward compatibility
         evidence_dict["certificate_id"] = certificate.certificate_id
         evidence_dict["issued_at"] = certificate.issued_at.isoformat()
@@ -332,6 +339,18 @@ class EvidencePackGenerator:
                 "explanation": f"Prior quarantine history ({ml_signals.get('prior_quarantine_count')} instances) increases risk",
             })
 
+        # Populate ML model metadata
+        model_metadata = {}
+        if isinstance(ml_signals.get("model_metadata"), dict):
+            # Use model metadata from ML signals if provided
+            model_metadata = ml_signals["model_metadata"]
+        else:
+            # Fallback to settings if available
+            model_metadata = {
+                "risk_model_version": getattr(settings, "ml_risk_model_version", "unknown"),
+                "anomaly_model_version": getattr(settings, "ml_anomaly_model_version", "unknown"),
+            }
+
         ml_signals_context = MLSignalsContext(
             risk_score=risk_score,
             assurance_score=assurance_score,
@@ -345,7 +364,7 @@ class EvidencePackGenerator:
             primary_label=ml_signals.get("primary_label"),
             class_probabilities=ml_signals.get("class_probabilities"),
             feature_contributions=feature_contributions,
-            model_metadata={},  # Can be populated from ML inference service metadata
+            model_metadata=model_metadata,
         )
 
         # Regulatory Profile
@@ -408,13 +427,37 @@ class EvidencePackGenerator:
             upload.decision, risk_band
         )
 
-        # Build counterfactuals (simplified - without re-running policy engine)
+        # Build counterfactuals using tenant policy thresholds
         counterfactuals = []
         if risk_score > 0:
+            # Get thresholds from policy profile (matching PolicyEngine defaults)
+            thresholds = policy_profile.thresholds_json if policy_profile and policy_profile.thresholds_json else {}
+            review_threshold = thresholds.get("risk_threshold_review", 40)
+            quarantine_threshold = thresholds.get("risk_threshold_quarantine", 70)
+            reject_threshold = thresholds.get("risk_threshold_reject", 90)
+
+            # Helper to determine decision from risk score using tenant thresholds
+            def _decision_from_risk(score: float) -> str:
+                if score >= reject_threshold:
+                    return "REJECT"
+                elif score >= quarantine_threshold:
+                    return "QUARANTINE"
+                elif score >= review_threshold:
+                    return "REVIEW"
+                else:
+                    return "ALLOW"
+
+            # Counterfactual: risk_score - 10
+            cf_risk_score = max(0.0, risk_score - 10.0)
+            cf_decision = _decision_from_risk(cf_risk_score)
             counterfactual_lower = {
-                "scenario": f"risk_score -10 (hypothetical: {risk_score - 10:.1f})",
-                "decision": "ALLOW" if risk_score - 10 < 40 else "REVIEW",
-                "rationale": "Lower risk score would result in less restrictive decision",
+                "scenario": f"risk_score -10 (hypothetical: {cf_risk_score:.1f})",
+                "decision": cf_decision,
+                "rationale": (
+                    f"If risk score were 10 points lower (from {risk_score:.1f} to {cf_risk_score:.1f}), "
+                    f"under the current tenant policy thresholds (review={review_threshold}, "
+                    f"quarantine={quarantine_threshold}, reject={reject_threshold}) this would result in {cf_decision}."
+                ),
             }
             counterfactuals.append(counterfactual_lower)
 
@@ -486,7 +529,7 @@ class EvidencePackGenerator:
             generated_at=datetime.utcnow(),
             generated_by_version=f"origin-api@{settings.environment}",
             audience=audience,
-            redactions={},  # Can be populated based on audience
+            redactions=[],  # Will be populated by _apply_audience_redactions
         )
 
         # Build EvidencePackV2
@@ -587,6 +630,45 @@ class EvidencePackGenerator:
             "last_90_days": decision_counts,
             "total_decisions": sum(decision_counts.values()),
         }
+
+    def _apply_audience_redactions(self, evidence_dict: dict, audience: str) -> list:
+        """Apply audience-specific redactions to evidence dict.
+        
+        Returns list of redaction records for audit_metadata.redactions.
+        """
+        redactions = []
+        
+        if audience == "INTERNAL" or audience == "REGULATOR":
+            # No redactions for INTERNAL or REGULATOR audiences
+            return redactions
+        
+        # DSP audience: redact internal-only fields
+        if audience == "DSP":
+            # Redact cross_tenant_signals
+            if "identity_and_history" in evidence_dict:
+                identity_history = evidence_dict["identity_and_history"]
+                if isinstance(identity_history, dict) and "cross_tenant_signals" in identity_history:
+                    del identity_history["cross_tenant_signals"]
+                    redactions.append({
+                        "path": "identity_and_history.cross_tenant_signals",
+                        "reason": "INTERNAL_SIGNALING_ONLY",
+                        "applied_for_audience": audience,
+                    })
+            
+            # Redact certificate signature
+            if "technical_trace_and_ledger" in evidence_dict:
+                tech_trace = evidence_dict["technical_trace_and_ledger"]
+                if isinstance(tech_trace, dict) and "certificate_data" in tech_trace:
+                    cert_data = tech_trace["certificate_data"]
+                    if isinstance(cert_data, dict) and "signature" in cert_data:
+                        del cert_data["signature"]
+                        redactions.append({
+                            "path": "technical_trace_and_ledger.certificate_data.signature",
+                            "reason": "INTERNAL_CRYPTOGRAPHIC_DETAIL",
+                            "applied_for_audience": audience,
+                        })
+        
+        return redactions
 
     def generate_pdf(
         self, certificate: DecisionCertificate, upload: Upload, evidence_json: Optional[dict] = None

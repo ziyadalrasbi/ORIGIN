@@ -166,7 +166,7 @@ class AuditMetadata(BaseModel):
     generated_at: datetime
     generated_by_version: str = "origin-api@unknown"
     audience: str = "INTERNAL"  # INTERNAL, DSP, REGULATOR
-    redactions: Dict[str, Any] = Field(default_factory=dict)  # Fields redacted for this audience
+    redactions: List[Dict[str, Any]] = Field(default_factory=list)  # List of redaction records
 
 
 # ============================================================================

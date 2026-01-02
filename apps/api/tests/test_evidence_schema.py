@@ -189,3 +189,25 @@ def test_decision_summary_human_review_required():
     summary = DecisionSummary(decision="ALLOW", human_review_required=False)
     assert summary.human_review_required is False
 
+
+def test_ml_signals_context_model_metadata():
+    """Test that MLSignalsContext can have model_metadata populated."""
+    # Test with provided model_metadata
+    ml_signals = MLSignalsContext(
+        risk_score=50.0,
+        assurance_score=70.0,
+        model_metadata={
+            "risk_model_version": "v2.1.0",
+            "anomaly_model_version": "v1.5.0",
+        },
+    )
+    assert ml_signals.model_metadata["risk_model_version"] == "v2.1.0"
+    assert ml_signals.model_metadata["anomaly_model_version"] == "v1.5.0"
+    
+    # Test with empty model_metadata (default)
+    ml_signals_empty = MLSignalsContext(
+        risk_score=50.0,
+        assurance_score=70.0,
+    )
+    assert ml_signals_empty.model_metadata == {}
+
