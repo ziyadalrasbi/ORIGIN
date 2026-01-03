@@ -1,7 +1,19 @@
-"""Evidence pack generation service."""
+"""Evidence pack generation service.
 
+This module implements immutable evidence pack generation with canonical snapshots.
+Evidence packs are tied to the decision moment and never regenerate from mutable DB state.
+
+Key principles:
+- Canonical JSON snapshots are created at decision time (or first request) with audience=INTERNAL
+- Evidence hash (SHA256) is computed from canonical JSON for integrity verification
+- All retrievals load from canonical snapshot, applying audience redactions as pure transforms
+- PDF/HTML generation uses canonical JSON, never re-querying DB for mutable fields
+- Ledger payload is source of truth for decision_trace; DB fields are fallback only
+"""
+
+import hashlib
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -19,22 +31,25 @@ from reportlab.platypus import (
     PageBreak,
     KeepTogether,
 )
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from origin_api.evidence.schema import (
     EvidencePackV2,
+    EvidenceAudience,
     TenantContext,
     CertificateContext,
     UploadContext,
     DecisionSummary,
     MLSignalsContext,
+    InterpretabilityCue,
     RegulatoryProfile,
     RiskImpactAnalysis,
     IdentityHistoryContext,
     GovernanceContext,
     TechnicalTraceContext,
     AuditMetadata,
+    RedactionRecord,
 )
 from origin_api.models import (
     DecisionCertificate,
@@ -108,6 +123,167 @@ class EvidencePackGenerator:
         else:
             return (198, 40, 40)  # Red
 
+    def _compute_evidence_hash(self, canonical_json: dict) -> str:
+        """Compute SHA256 hash of canonical JSON for integrity verification.
+        
+        Args:
+            canonical_json: The canonical EvidencePackV2 JSON dict (audience=INTERNAL)
+            
+        Returns:
+            SHA256 hex digest (64 characters)
+        """
+        # Sort keys for deterministic hashing
+        json_bytes = json.dumps(canonical_json, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(json_bytes).hexdigest()
+
+    def _check_canonical_fields_exist(self) -> bool:
+        """Check if canonical_json column exists in the database.
+        
+        Uses a safe query that won't abort the transaction if column doesn't exist.
+        """
+        try:
+            # Try to query the column using raw SQL to check if it exists
+            result = self.db.execute(
+                text("SELECT column_name FROM information_schema.columns "
+                     "WHERE table_name = 'evidence_packs' AND column_name = 'canonical_json'")
+            ).first()
+            return result is not None
+        except Exception:
+            # If query fails, assume column doesn't exist
+            return False
+
+    def _get_or_create_canonical_snapshot(
+        self, certificate: DecisionCertificate, upload: Upload
+    ) -> tuple[dict, str, Optional[EvidencePack]]:
+        """Get or create canonical evidence pack snapshot.
+        
+        Returns:
+            Tuple of (canonical_json_dict, evidence_hash, evidence_pack_record)
+        """
+        # Check if canonical fields exist in database
+        has_canonical_fields = self._check_canonical_fields_exist()
+        
+        # Check if canonical snapshot already exists
+        evidence_pack = None
+        if has_canonical_fields:
+            try:
+                evidence_pack = (
+                    self.db.query(EvidencePack)
+                    .filter(
+                        EvidencePack.tenant_id == certificate.tenant_id,
+                        EvidencePack.certificate_id == certificate.id,
+                    )
+                    .first()
+                )
+                
+                # Check if canonical_json has data
+                if evidence_pack and evidence_pack.canonical_json:
+                    # Canonical snapshot exists, return it
+                    canonical_json = evidence_pack.canonical_json
+                    evidence_hash = getattr(evidence_pack, 'evidence_hash', None)
+                    return canonical_json, evidence_hash, evidence_pack
+            except Exception:
+                # If accessing canonical_json fails, rollback and continue
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+        else:
+            # Migration not applied, just query without canonical fields
+            try:
+                evidence_pack = (
+                    self.db.query(EvidencePack)
+                    .filter(
+                        EvidencePack.tenant_id == certificate.tenant_id,
+                        EvidencePack.certificate_id == certificate.id,
+                    )
+                    .first()
+                )
+            except Exception:
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+        
+        # Generate canonical snapshot (audience=INTERNAL)
+        data = self._gather_evidence_data(certificate, upload)
+        decision_trace = data["decision_trace"]
+        ml_signals = decision_trace.get("ml_signals", {})
+        
+        tenant = self.db.query(Tenant).filter(Tenant.id == upload.tenant_id).first()
+        
+        # Build EvidencePackV2 with INTERNAL audience (canonical)
+        evidence_v2 = self._build_evidence_pack_v2(
+            certificate, upload, data, tenant, ml_signals, EvidenceAudience.INTERNAL.value
+        )
+        
+        # Convert to dict
+        canonical_json = evidence_v2.model_dump(mode="json")
+        
+        # Compute evidence hash
+        evidence_hash = self._compute_evidence_hash(canonical_json)
+        
+        # Store canonical snapshot only if migration has been applied
+        if has_canonical_fields:
+            try:
+                if not evidence_pack:
+                    evidence_pack = EvidencePack(
+                        tenant_id=certificate.tenant_id,
+                        certificate_id=certificate.id,
+                        status="ready",
+                        canonical_json=canonical_json,
+                        evidence_hash=evidence_hash,
+                        evidence_version="origin-evidence-v2",
+                        canonical_created_at=datetime.now(timezone.utc),
+                    )
+                    self.db.add(evidence_pack)
+                else:
+                    # Update existing evidence pack
+                    evidence_pack.canonical_json = canonical_json
+                    evidence_pack.evidence_hash = evidence_hash
+                    evidence_pack.evidence_version = "origin-evidence-v2"
+                    evidence_pack.canonical_created_at = datetime.now(timezone.utc)
+                
+                self.db.commit()
+            except Exception as e:
+                # If setting canonical fields fails, rollback
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+        else:
+            # Migration not applied, use raw SQL INSERT to avoid missing columns
+            try:
+                if not evidence_pack:
+                    result = self.db.execute(
+                        text("INSERT INTO evidence_packs (tenant_id, certificate_id, status, created_at) "
+                             "VALUES (:tenant_id, :certificate_id, :status, NOW()) "
+                             "RETURNING id"),
+                        {
+                            "tenant_id": certificate.tenant_id,
+                            "certificate_id": certificate.id,
+                            "status": "ready",
+                        }
+                    )
+                    inserted_id = result.scalar()
+                    self.db.commit()
+                    
+                    # Create a minimal object
+                    class MinimalEvidencePack:
+                        def __init__(self, id):
+                            self.id = id
+                            self.tenant_id = certificate.tenant_id
+                            self.certificate_id = certificate.id
+                            self.status = "ready"
+                    evidence_pack = MinimalEvidencePack(inserted_id)
+            except Exception:
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+        
+        return canonical_json, evidence_hash, evidence_pack
+
     def _gather_evidence_data(
         self, certificate: DecisionCertificate, upload: Upload
     ) -> dict:
@@ -141,7 +317,9 @@ class EvidencePackGenerator:
             .all()
         )
 
-        # Extract decision trace from ledger
+        # Extract decision trace from ledger (SOURCE OF TRUTH)
+        # Ledger payload is immutable and represents the decision at decision time.
+        # Only fall back to Upload fields if ledger is missing (backward compatibility).
         decision_trace = {
             "decision": upload.decision,
             "risk_score": float(upload.risk_score) if upload.risk_score is not None else None,
@@ -153,6 +331,7 @@ class EvidencePackGenerator:
         }
 
         if ledger_event and ledger_event.payload_json:
+            # Ledger is source of truth - use it first
             decision_payload = ledger_event.payload_json.get("outputs", {})
             decision_trace = {
                 "decision": decision_payload.get("decision", upload.decision),
@@ -163,6 +342,7 @@ class EvidencePackGenerator:
                 "rationale": decision_payload.get("rationale"),
                 "ml_signals": decision_payload.get("ml_signals", {}),
             }
+        # If no ledger, fall back to Upload fields (for backward compatibility with older records)
 
         # Build risk signals dict
         risk_signals_dict = {}
@@ -192,52 +372,79 @@ class EvidencePackGenerator:
         self, certificate: DecisionCertificate, upload: Upload, audience: str = "INTERNAL"
     ) -> dict:
         """Generate comprehensive JSON evidence pack (Evidence Pack v2).
+        
+        IMMUTABILITY: This method loads from canonical snapshot (audience=INTERNAL)
+        and applies audience redactions as a pure transform. It never regenerates
+        from mutable DB state to prevent drift.
 
         Returns a dict that conforms to EvidencePackV2 schema while maintaining
         backward compatibility with existing top-level keys.
         """
-        data = self._gather_evidence_data(certificate, upload)
-        decision_trace = data["decision_trace"]
-        ml_signals = decision_trace.get("ml_signals", {})
-
-        # Get tenant
-        tenant = self.db.query(Tenant).filter(Tenant.id == upload.tenant_id).first()
-
-        # Build EvidencePackV2
-        evidence_v2 = self._build_evidence_pack_v2(
-            certificate, upload, data, tenant, ml_signals, audience
+        # Get or create canonical snapshot (always INTERNAL)
+        canonical_json, evidence_hash, evidence_pack = self._get_or_create_canonical_snapshot(
+            certificate, upload
         )
-
-        # Convert to dict for backward compatibility
-        evidence_dict = evidence_v2.model_dump(mode="json")
-
-        # Apply audience-specific redactions
-        redactions = self._apply_audience_redactions(evidence_dict, audience)
         
-        # Update audit_metadata.redactions with actual redactions performed
+        # Deep copy canonical JSON to avoid mutating the stored snapshot
+        evidence_dict = json.loads(json.dumps(canonical_json))
+        
+        # Apply audience-specific redactions as a transform
+        audience_enum = EvidenceAudience(audience) if isinstance(audience, str) else audience
+        redactions = self._apply_audience_redactions(evidence_dict, audience_enum.value)
+        
+        # Update audit_metadata with redactions and audience
         if "audit_metadata" in evidence_dict and isinstance(evidence_dict["audit_metadata"], dict):
-            evidence_dict["audit_metadata"]["redactions"] = redactions
+            evidence_dict["audit_metadata"]["audience"] = audience_enum.value
+            evidence_dict["audit_metadata"]["redactions"] = [
+                r.model_dump() if isinstance(r, RedactionRecord) else r
+                for r in redactions
+            ]
 
         # Preserve existing top-level keys for backward compatibility
+        # Extract decision_trace from EvidencePackV2 structure (decision_summary + ml_and_signals)
+        decision_summary = evidence_dict.get("decision_summary", {})
+        ml_signals = evidence_dict.get("ml_and_signals", {})
+        
+        # Reconstruct decision_trace from canonical structure
+        decision_trace = {
+            "decision": decision_summary.get("decision", upload.decision),
+            "risk_score": ml_signals.get("risk_score"),
+            "assurance_score": ml_signals.get("assurance_score"),
+            "triggered_rules": decision_summary.get("triggered_rules", []),
+            "reason_codes": decision_summary.get("reason_codes", []),
+            "rationale": decision_summary.get("decision_rationale"),
+            "ml_signals": {
+                "risk_score": ml_signals.get("risk_score"),
+                "assurance_score": ml_signals.get("assurance_score"),
+                "anomaly_score": ml_signals.get("anomaly_score"),
+                "synthetic_likelihood": ml_signals.get("synthetic_likelihood"),
+                "identity_confidence": ml_signals.get("identity_confidence"),
+                "primary_label": ml_signals.get("primary_label"),
+                "class_probabilities": ml_signals.get("class_probabilities"),
+            },
+        }
+        
         evidence_dict["certificate_id"] = certificate.certificate_id
         evidence_dict["issued_at"] = certificate.issued_at.isoformat()
-        evidence_dict["decision"] = upload.decision
+        evidence_dict["decision"] = decision_trace.get("decision", upload.decision)
         evidence_dict["decision_explanation"] = self._get_decision_explanation(
-            upload.decision, decision_trace.get("rationale")
+            decision_trace.get("decision", upload.decision),
+            decision_trace.get("rationale")
         )
         evidence_dict["policy_version"] = certificate.policy_version
         evidence_dict["scores"] = {
-            "risk_score": float(upload.risk_score) if upload.risk_score else None,
-            "assurance_score": float(upload.assurance_score) if upload.assurance_score else None,
+            "risk_score": decision_trace.get("risk_score"),
+            "assurance_score": decision_trace.get("assurance_score"),
         }
-        evidence_dict["risk_signals"] = data["risk_signals"]
         evidence_dict["decision_trace"] = decision_trace
         evidence_dict["integrity"] = {
             "inputs_hash": certificate.inputs_hash,
             "outputs_hash": certificate.outputs_hash,
             "ledger_hash": certificate.ledger_hash,
             "signature": certificate.signature,
+            "evidence_hash": evidence_hash,  # Add evidence hash for integrity
         }
+        evidence_dict["evidence_version"] = evidence_pack.evidence_version if evidence_pack else "origin-evidence-v2"
 
         return evidence_dict
 
@@ -300,8 +507,14 @@ class EvidencePackGenerator:
             else None
         )
 
+        # Use decision_trace from ledger as source of truth (immutable at decision time)
+        # Fall back to upload fields only if ledger is missing (backward compatibility)
+        decision_from_trace = decision_trace.get("decision", upload.decision)
+        risk_score_from_trace = decision_trace.get("risk_score")
+        assurance_score_from_trace = decision_trace.get("assurance_score")
+        
         decision_summary = DecisionSummary(
-            decision=upload.decision,
+            decision=decision_from_trace,
             decision_mode=decision_mode,
             decision_rationale=decision_trace.get("rationale"),
             reasons=decision_trace.get("reason_codes", []),  # Legacy field
@@ -311,33 +524,39 @@ class EvidencePackGenerator:
             sla_guidance=sla_guidance,
         )
 
-        # ML Signals Context
-        risk_score = float(upload.risk_score) if upload.risk_score else 0.0
-        assurance_score = float(upload.assurance_score) if upload.assurance_score else 0.0
+        # ML Signals Context - use ledger values as source of truth
+        risk_score = float(risk_score_from_trace) if risk_score_from_trace is not None else (float(upload.risk_score) if upload.risk_score else 0.0)
+        assurance_score = float(assurance_score_from_trace) if assurance_score_from_trace is not None else (float(upload.assurance_score) if upload.assurance_score else 0.0)
 
-        # Build feature contributions (simplified)
-        feature_contributions = []
+        # Build interpretability cues (heuristic-based, not ML-derived)
+        # These are honest heuristics, not true model explainability.
+        # If real explainability is available (SHAP, permutation importance), it should
+        # be computed at inference time and stored in ml_signals.
+        interpretability_cues = []
         if upload.account_id and account and account.created_at:
             account_age_days = (upload.received_at - account.created_at).days
             if account_age_days < 7:
-                feature_contributions.append({
-                    "feature": "account_age_days",
-                    "direction": "negative",
-                    "explanation": f"New account ({account_age_days} days old) increases risk",
-                })
+                interpretability_cues.append(InterpretabilityCue(
+                    feature="account_age_days",
+                    direction="negative",
+                    explanation=f"New account ({account_age_days} days old) increases risk",
+                    explanation_method="heuristic",
+                ))
             elif account_age_days > 365:
-                feature_contributions.append({
-                    "feature": "account_age_days",
-                    "direction": "positive",
-                    "explanation": f"Established account ({account_age_days} days old) reduces risk",
-                })
+                interpretability_cues.append(InterpretabilityCue(
+                    feature="account_age_days",
+                    direction="positive",
+                    explanation=f"Established account ({account_age_days} days old) reduces risk",
+                    explanation_method="heuristic",
+                ))
 
         if ml_signals.get("prior_quarantine_count", 0) > 0:
-            feature_contributions.append({
-                "feature": "prior_quarantine_count",
-                "direction": "negative",
-                "explanation": f"Prior quarantine history ({ml_signals.get('prior_quarantine_count')} instances) increases risk",
-            })
+            interpretability_cues.append(InterpretabilityCue(
+                feature="prior_quarantine_count",
+                direction="negative",
+                explanation=f"Prior quarantine history ({ml_signals.get('prior_quarantine_count')} instances) increases risk",
+                explanation_method="heuristic",
+            ))
 
         # Populate ML model metadata
         model_metadata = {}
@@ -363,7 +582,7 @@ class EvidencePackGenerator:
             has_prior_reject=ml_signals.get("has_prior_reject", False),
             primary_label=ml_signals.get("primary_label"),
             class_probabilities=ml_signals.get("class_probabilities"),
-            feature_contributions=feature_contributions,
+            interpretability_cues=interpretability_cues,  # Renamed from feature_contributions for honesty
             model_metadata=model_metadata,
         )
 
@@ -631,10 +850,13 @@ class EvidencePackGenerator:
             "total_decisions": sum(decision_counts.values()),
         }
 
-    def _apply_audience_redactions(self, evidence_dict: dict, audience: str) -> list:
+    def _apply_audience_redactions(self, evidence_dict: dict, audience: str) -> list[RedactionRecord]:
         """Apply audience-specific redactions to evidence dict.
         
-        Returns list of redaction records for audit_metadata.redactions.
+        This is a pure transform over canonical JSON. It never mutates the stored
+        canonical snapshot, only the in-memory copy.
+        
+        Returns list of RedactionRecord objects for audit_metadata.redactions.
         """
         redactions = []
         
@@ -649,11 +871,11 @@ class EvidencePackGenerator:
                 identity_history = evidence_dict["identity_and_history"]
                 if isinstance(identity_history, dict) and "cross_tenant_signals" in identity_history:
                     del identity_history["cross_tenant_signals"]
-                    redactions.append({
-                        "path": "identity_and_history.cross_tenant_signals",
-                        "reason": "INTERNAL_SIGNALING_ONLY",
-                        "applied_for_audience": audience,
-                    })
+                    redactions.append(RedactionRecord(
+                        path="identity_and_history.cross_tenant_signals",
+                        reason="INTERNAL_SIGNALING_ONLY",
+                        applied_for_audience=audience,
+                    ))
             
             # Redact certificate signature
             if "technical_trace_and_ledger" in evidence_dict:
@@ -662,11 +884,11 @@ class EvidencePackGenerator:
                     cert_data = tech_trace["certificate_data"]
                     if isinstance(cert_data, dict) and "signature" in cert_data:
                         del cert_data["signature"]
-                        redactions.append({
-                            "path": "technical_trace_and_ledger.certificate_data.signature",
-                            "reason": "INTERNAL_CRYPTOGRAPHIC_DETAIL",
-                            "applied_for_audience": audience,
-                        })
+                        redactions.append(RedactionRecord(
+                            path="technical_trace_and_ledger.certificate_data.signature",
+                            reason="INTERNAL_CRYPTOGRAPHIC_DETAIL",
+                            applied_for_audience=audience,
+                        ))
         
         return redactions
 

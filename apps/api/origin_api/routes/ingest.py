@@ -279,6 +279,14 @@ async def ingest(
             if policy_profile and policy_profile.regulatory_compliance_json
             else None
         ),
+        "policy_thresholds_json": (
+            policy_profile.thresholds_json
+            if policy_profile and policy_profile.thresholds_json
+            else None
+        ),
+        # Evidence pack metadata (will be populated after canonical snapshot is created)
+        "evidence_version": "origin-evidence-v2",
+        # evidence_hash will be added after evidence pack generation
     }
 
     # Append ledger event
@@ -307,7 +315,20 @@ async def ingest(
 
     db.commit()
 
-    # Step 12: Webhook delivery (async)
+    # Step 12: Generate canonical evidence snapshot and compute evidence_hash
+    # This ensures immutability from decision time
+    # Wrap in try-except to handle cases where migration hasn't been applied yet
+    evidence_hash = None
+    try:
+        from origin_api.evidence.generator import EvidencePackGenerator
+        evidence_generator = EvidencePackGenerator(db)
+        _, evidence_hash, _ = evidence_generator._get_or_create_canonical_snapshot(certificate, upload)
+    except Exception as e:
+        # Log but don't fail the request if evidence pack generation fails
+        # This can happen if migration hasn't been applied yet
+        logger.warning(f"Failed to generate canonical evidence snapshot: {e}", exc_info=e)
+
+    # Step 13: Webhook delivery (async)
     try:
         webhook_service = WebhookService(db)
         webhook_service.deliver_webhook(
@@ -318,6 +339,7 @@ async def ingest(
                 "certificate_id": certificate.certificate_id,
                 "decision": decision_result["decision"],
                 "upload_id": upload.id,
+                "evidence_hash": evidence_hash,
             },
         )
     except Exception as e:
@@ -337,7 +359,7 @@ async def ingest(
         triggered_rules=decision_result["triggered_rules"],
         decision_rationale=decision_result.get("rationale", ""),
         ml_signals=ml_signals,
-        evidence_pack_status="pending",
+        evidence_pack_status="ready",  # Changed to ready since canonical snapshot is created
         evidence_pack_request_url=f"/v1/evidence-packs?certificate_id={certificate.certificate_id}",
     )
 

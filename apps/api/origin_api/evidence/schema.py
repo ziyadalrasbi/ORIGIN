@@ -11,10 +11,40 @@ The schema is designed to be backward compatible with existing evidence pack
 structures while adding new regulatory-aligned fields.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+# ============================================================================
+# Enums
+# ============================================================================
+
+
+class EvidenceAudience(str, Enum):
+    """Evidence pack audience types."""
+
+    INTERNAL = "INTERNAL"
+    DSP = "DSP"
+    REGULATOR = "REGULATOR"
+
+
+class EvidenceFormat(str, Enum):
+    """Evidence pack format types."""
+
+    JSON = "json"
+    PDF = "pdf"
+    HTML = "html"
+
+
+class RedactionRecord(BaseModel):
+    """Redaction record for audit metadata."""
+
+    path: str
+    reason: str
+    applied_for_audience: str
 
 
 # ============================================================================
@@ -71,6 +101,15 @@ class DecisionSummary(BaseModel):
     sla_guidance: Optional[str] = None  # e.g., "60-minute review target for REVIEW decisions"
 
 
+class InterpretabilityCue(BaseModel):
+    """Interpretability cue (heuristic or model-based explanation)."""
+
+    feature: str
+    direction: str  # positive, negative
+    explanation: str
+    explanation_method: Literal["heuristic", "model_based"] = "heuristic"
+
+
 class MLSignalsContext(BaseModel):
     """ML model signals and predictions."""
 
@@ -85,9 +124,9 @@ class MLSignalsContext(BaseModel):
     has_prior_reject: bool = False
     primary_label: Optional[str] = None
     class_probabilities: Optional[Dict[str, float]] = None
-    feature_contributions: List[Dict[str, Any]] = Field(
+    interpretability_cues: List[InterpretabilityCue] = Field(
         default_factory=list
-    )  # [{"feature": "account_age", "direction": "positive", "explanation": "..."}]
+    )  # Renamed from feature_contributions for honesty
     model_metadata: Dict[str, Any] = Field(
         default_factory=dict
     )  # {"risk_model_version": "...", "anomaly_model_version": "..."}
@@ -165,8 +204,16 @@ class AuditMetadata(BaseModel):
 
     generated_at: datetime
     generated_by_version: str = "origin-api@unknown"
-    audience: str = "INTERNAL"  # INTERNAL, DSP, REGULATOR
-    redactions: List[Dict[str, Any]] = Field(default_factory=list)  # List of redaction records
+    audience: EvidenceAudience = EvidenceAudience.INTERNAL
+    redactions: List[RedactionRecord] = Field(default_factory=list)
+
+    @field_validator("generated_at")
+    @classmethod
+    def ensure_timezone_aware(cls, v: datetime) -> datetime:
+        """Ensure datetime is timezone-aware (UTC)."""
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
 
 
 # ============================================================================
@@ -208,6 +255,7 @@ class EvidencePackV2(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat(),
         }
-        # Allow extra fields for backward compatibility
+        # Allow extra fields for backward compatibility only
         extra = "ignore"
+        use_enum_values = True  # Serialize enums as their values
 
