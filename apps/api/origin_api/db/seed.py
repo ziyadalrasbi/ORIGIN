@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
+from origin_api.auth.api_key import generate_api_key, hash_api_key
 from origin_api.models import (
     APIKey,
     Account,
@@ -41,10 +42,13 @@ def seed_tenants(db: Session):
         db.add(demo_tenant)
         db.flush()
 
-        # Create API key
+        # Create API key (use legacy format for demo compatibility)
+        # In production, use generate_api_key() for new format
+        demo_key = "demo-api-key-12345"
         api_key = APIKey(
             tenant_id=demo_tenant.id,
-            hash=hash_api_key("demo-api-key-12345"),
+            hash=hash_api_key(demo_key),
+            public_id=None,  # Legacy key, no public_id
             label="Default API Key",
             scopes='["ingest", "evidence", "read"]',
             is_active=True,

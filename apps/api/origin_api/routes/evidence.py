@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -69,7 +70,9 @@ class EvidencePackResponse(BaseModel):
     ready_at: Optional[str] = None  # ISO8601 timestamp
     poll_url: Optional[str] = None
     retry_after_seconds: Optional[int] = None
-    task_state: Optional[str] = None  # PENDING, STARTED, SUCCESS, FAILURE
+    task_id: Optional[str] = None  # Celery task ID
+    task_status: Optional[str] = None  # PENDING, STARTED, SUCCESS, FAILURE, RETRY
+    task_state: Optional[str] = None  # Deprecated: use task_status. Kept for backward compatibility.
     error_code: Optional[str] = None
     error_message: Optional[str] = None
 
@@ -299,14 +302,21 @@ async def request_evidence_pack(
                             "task_id": evidence_pack.task_id,
                         },
                     )
-                    return EvidencePackResponse(
-                        status="pending",
-                        certificate_id=request_data.certificate_id,
-                        audience=determined_audience,
-                        formats=formats,
-                        poll_url=f"/v1/evidence-packs/{request_data.certificate_id}",
-                        retry_after_seconds=30,
-                        task_state=evidence_pack.task_id if evidence_pack.task_id else None,
+                    response_data = {
+                        "status": "pending",
+                        "certificate_id": request_data.certificate_id,
+                        "audience": determined_audience,
+                        "formats": formats,
+                        "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
+                        "retry_after_seconds": 30,
+                        "task_id": evidence_pack.task_id,
+                        "task_status": None,
+                        "task_state": evidence_pack.task_id if evidence_pack.task_id else None,  # Backward compatibility
+                    }
+                    return JSONResponse(
+                        status_code=status.HTTP_202_ACCEPTED,
+                        content=response_data,
+                        headers={"Retry-After": "30"},
                     )
                 # Stuck - will re-enqueue below
                 logger.warning(
@@ -364,13 +374,16 @@ async def request_evidence_pack(
         evidence_pack.updated_at = now
         db.commit()
         
-        return EvidencePackResponse(
-            status="failed",
-            certificate_id=request_data.certificate_id,
-            audience=determined_audience,
-            formats=formats,
-            error_code="CELERY_UNAVAILABLE",
-            error_message="Evidence pack generation service unavailable (Celery/worker not configured)",
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "failed",
+                "certificate_id": request_data.certificate_id,
+                "audience": determined_audience,
+                "formats": formats,
+                "error_code": "CELERY_UNAVAILABLE",
+                "error_message": "Evidence pack generation service unavailable (Celery/worker not configured)",
+            },
         )
     
     # Check if task is already running (using stored task_id)
@@ -432,10 +445,14 @@ async def request_evidence_pack(
                 "task_id": task_id,
             },
         )
-    except ImportError as e:
-        # Celery or worker not available - return 503 Service Unavailable
+    except (ImportError, ConnectionError) as e:
+        # Celery or broker not available - return 503 Service Unavailable
+        error_code = "CELERY_UNAVAILABLE"
+        if isinstance(e, ConnectionError):
+            error_code = "BROKER_UNAVAILABLE"
+        
         logger.error(
-            f"Celery unavailable, cannot enqueue evidence pack task: {e}",
+            f"Celery/broker unavailable, cannot enqueue evidence pack task: {e}",
             extra={
                 "correlation_id": correlation_id,
                 "certificate_id": certificate.certificate_id,
@@ -447,21 +464,24 @@ async def request_evidence_pack(
         )
         # Update status to failed
         evidence_pack.status = "failed"
-        evidence_pack.error_code = "CELERY_UNAVAILABLE"
-        evidence_pack.error_message = "Evidence pack generation service unavailable (Celery/worker not configured)"
-        evidence_pack.updated_at = datetime.now(timezone.utc)
+        evidence_pack.error_code = error_code
+        evidence_pack.error_message = "Evidence pack generation service unavailable (Celery/worker/broker not configured)"
+        evidence_pack.updated_at = now
         db.commit()
         
-        return EvidencePackResponse(
-            status="failed",
-            certificate_id=request_data.certificate_id,
-            audience=determined_audience,
-            formats=formats,
-            error_code="CELERY_UNAVAILABLE",
-            error_message="Evidence pack generation service unavailable (Celery/worker not configured)",
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "failed",
+                "certificate_id": request_data.certificate_id,
+                "audience": determined_audience,
+                "formats": formats,
+                "error_code": error_code,
+                "error_message": "Evidence pack generation service unavailable (Celery/worker/broker not configured)",
+            },
         )
     except Exception as e:
-        # Other errors (broker misconfigured, etc.) - return 503
+        # Other errors (broker misconfigured, kombu errors, etc.) - return 503
         logger.error(
             f"Failed to enqueue evidence pack task: {e}",
             extra={
@@ -477,16 +497,19 @@ async def request_evidence_pack(
         evidence_pack.status = "failed"
         evidence_pack.error_code = "TASK_ENQUEUE_FAILED"
         evidence_pack.error_message = f"Failed to enqueue generation task: {str(e)[:200]}"
-        evidence_pack.updated_at = datetime.now(timezone.utc)
+        evidence_pack.updated_at = now
         db.commit()
         
-        return EvidencePackResponse(
-            status="failed",
-            certificate_id=request_data.certificate_id,
-            audience=determined_audience,
-            formats=formats,
-            error_code="TASK_ENQUEUE_FAILED",
-            error_message=f"Failed to enqueue generation task: {str(e)[:200]}",
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "failed",
+                "certificate_id": request_data.certificate_id,
+                "audience": determined_audience,
+                "formats": formats,
+                "error_code": "TASK_ENQUEUE_FAILED",
+                "error_message": f"Failed to enqueue generation task: {str(e)[:200]}",
+            },
         )
     
     return EvidencePackResponse(
@@ -633,14 +656,21 @@ async def get_evidence_pack(
                         evidence_pack.updated_at = now
                         db.commit()
                         
-                        return EvidencePackResponse(
-                            status="pending",
-                            certificate_id=certificate_id,
-                            audience=evidence_pack.audience,
-                            formats=evidence_pack.formats,
-                            poll_url=f"/v1/evidence-packs/{certificate_id}",
-                            retry_after_seconds=30,
-                            task_state="stuck_requeued",
+                        response_data = {
+                            "status": "pending",
+                            "certificate_id": certificate_id,
+                            "audience": evidence_pack.audience,
+                            "formats": evidence_pack.formats,
+                            "poll_url": f"/v1/evidence-packs/{certificate_id}",
+                            "retry_after_seconds": 30,
+                            "task_id": retry_task_id,
+                            "task_status": "stuck_requeued",
+                            "task_state": "stuck_requeued",  # Backward compatibility
+                        }
+                        return JSONResponse(
+                            status_code=status.HTTP_202_ACCEPTED,
+                            content=response_data,
+                            headers={"Retry-After": "30"},
                         )
                     except Exception as e:
                         logger.error(
@@ -735,6 +765,18 @@ def _build_response(evidence_pack: EvidencePack, certificate_id: str, db: Sessio
                 # Legacy download URL
                 download_urls[fmt] = f"/v1/evidence-packs/{certificate_id}/download/{fmt}"
     
+    # Get task status from Celery if pending and task_id exists
+    task_status = None
+    if evidence_pack.status == "pending" and evidence_pack.task_id:
+        try:
+            from celery.result import AsyncResult
+            celery_app = get_celery_app()
+            task_result = AsyncResult(evidence_pack.task_id, app=celery_app)
+            task_status = task_result.state
+        except (ImportError, ConnectionError, Exception):
+            # Celery unavailable or task not found - use None
+            pass
+    
     return EvidencePackResponse(
         status=evidence_pack.status,
         certificate_id=certificate_id,
@@ -748,6 +790,9 @@ def _build_response(evidence_pack: EvidencePack, certificate_id: str, db: Sessio
         generated_at=evidence_pack.created_at.isoformat() if evidence_pack.created_at else None,
         ready_at=evidence_pack.ready_at.isoformat() if evidence_pack.ready_at else None,
         poll_url=f"/v1/evidence-packs/{certificate_id}" if evidence_pack.status == "pending" else None,
+        task_id=evidence_pack.task_id,
+        task_status=task_status,
+        task_state=task_status,  # Backward compatibility
         error_code=evidence_pack.error_code,
         error_message=evidence_pack.error_message,
     )

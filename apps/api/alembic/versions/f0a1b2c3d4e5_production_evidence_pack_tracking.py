@@ -18,7 +18,7 @@ depends_on = None
 
 def upgrade() -> None:
     # Add task tracking fields for idempotency and stuck detection
-    op.add_column('evidence_packs', sa.Column('task_id', sa.String(255), nullable=True, index=True))
+    op.add_column('evidence_packs', sa.Column('task_id', sa.String(255), nullable=True))
     op.add_column('evidence_packs', sa.Column('last_enqueued_at', sa.DateTime(timezone=True), nullable=True))
     op.add_column('evidence_packs', sa.Column('last_polled_at', sa.DateTime(timezone=True), nullable=True))
     op.add_column('evidence_packs', sa.Column('started_at', sa.DateTime(timezone=True), nullable=True))
@@ -30,22 +30,55 @@ def upgrade() -> None:
         # Column may already exist
         pass
     
-    # Add index for stuck detection queries
-    op.create_index(
-        'ix_evidence_packs_status_enqueued',
-        'evidence_packs',
-        ['status', 'last_enqueued_at']
-    )
+    # Create indexes explicitly (idempotent)
+    try:
+        op.create_index('ix_evidence_packs_task_id', 'evidence_packs', ['task_id'])
+    except Exception:
+        # Index may already exist
+        pass
+    
+    try:
+        op.create_index(
+            'ix_evidence_packs_status_enqueued',
+            'evidence_packs',
+            ['status', 'last_enqueued_at']
+        )
+    except Exception:
+        # Index may already exist
+        pass
 
 
 def downgrade() -> None:
-    # Drop indexes
-    op.drop_index('ix_evidence_packs_status_enqueued', table_name='evidence_packs')
+    # Drop indexes (idempotent)
+    try:
+        op.drop_index('ix_evidence_packs_status_enqueued', table_name='evidence_packs')
+    except Exception:
+        pass
+    
+    try:
+        op.drop_index('ix_evidence_packs_task_id', table_name='evidence_packs')
+    except Exception:
+        pass
     
     # Drop columns
-    op.drop_column('evidence_packs', 'updated_at')
-    op.drop_column('evidence_packs', 'started_at')
-    op.drop_column('evidence_packs', 'last_polled_at')
-    op.drop_column('evidence_packs', 'last_enqueued_at')
-    op.drop_column('evidence_packs', 'task_id')
+    try:
+        op.drop_column('evidence_packs', 'updated_at')
+    except Exception:
+        pass
+    try:
+        op.drop_column('evidence_packs', 'started_at')
+    except Exception:
+        pass
+    try:
+        op.drop_column('evidence_packs', 'last_polled_at')
+    except Exception:
+        pass
+    try:
+        op.drop_column('evidence_packs', 'last_enqueued_at')
+    except Exception:
+        pass
+    try:
+        op.drop_column('evidence_packs', 'task_id')
+    except Exception:
+        pass
 

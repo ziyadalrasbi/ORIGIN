@@ -1,4 +1,15 @@
-"""Evidence pack routes."""
+"""DEPRECATED: Do not use this module.
+
+This file is kept for reference only. The active evidence pack routes
+are in routes/evidence.py.
+
+This module will raise RuntimeError if imported to prevent accidental usage.
+"""
+
+raise RuntimeError(
+    "This module is deprecated. Use origin_api.routes.evidence instead. "
+    "This file is kept for reference only and should not be imported."
+)
 
 import logging
 from datetime import datetime

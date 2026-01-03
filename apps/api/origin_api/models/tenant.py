@@ -29,13 +29,20 @@ class Tenant(Base):
 
 
 class APIKey(Base):
-    """API key model for tenant authentication."""
+    """API key model for tenant authentication.
+    
+    API keys use format: "org_<env>_<public_id>.<secret>"
+    - public_id: Unique identifier for O(1) lookup (indexed)
+    - hash: bcrypt hash of secret only
+    - Legacy keys without public_id are supported via fallback path
+    """
 
     __tablename__ = "api_keys"
 
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
-    hash = Column(String(255), nullable=False, unique=True, index=True)
+    public_id = Column(String(64), nullable=True, unique=True, index=True)  # For O(1) lookup
+    hash = Column(String(255), nullable=False, unique=True, index=True)  # bcrypt hash of secret
     label = Column(String(255), nullable=True)
     scopes = Column(Text, nullable=True)  # JSON array of scopes
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

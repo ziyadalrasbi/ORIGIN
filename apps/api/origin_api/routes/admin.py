@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from origin_api.auth.api_key import hash_api_key
+from origin_api.auth.api_key import generate_api_key, hash_api_key, parse_api_key
 from origin_api.db.session import get_db
 from origin_api.models import APIKey, PolicyProfile, Tenant
 
@@ -149,10 +149,30 @@ async def rotate_api_key(
         APIKey.is_active == True,  # noqa: E712
     ).update({"is_active": False, "revoked_at": datetime.utcnow()})
 
+    # Parse or generate new API key
+    public_id = None
+    api_key_hash = None
+    
+    if request.new_api_key:
+        if "." in request.new_api_key and request.new_api_key.startswith("org_"):
+            # New format
+            public_id, secret = parse_api_key(request.new_api_key)
+            api_key_hash = hash_api_key(secret)
+        else:
+            # Legacy format
+            api_key_hash = hash_api_key(request.new_api_key)
+    else:
+        # Generate new key
+        full_key, public_id = generate_api_key(tenant.label, "prod")
+        _, secret = parse_api_key(full_key)
+        api_key_hash = hash_api_key(secret)
+        request.new_api_key = full_key
+    
     # Create new API key
     new_api_key = APIKey(
         tenant_id=tenant.id,
-        hash=hash_api_key(request.new_api_key),
+        public_id=public_id,
+        hash=api_key_hash,
         label=request.label or "Rotated API Key",
         scopes='["ingest", "evidence", "read"]',
         is_active=True,
@@ -160,7 +180,7 @@ async def rotate_api_key(
     db.add(new_api_key)
 
     # Update tenant's api_key_hash (legacy support)
-    tenant.api_key_hash = hash_api_key(request.new_api_key)
+    tenant.api_key_hash = api_key_hash
     tenant.rotated_at = datetime.utcnow()
 
     db.commit()

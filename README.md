@@ -129,6 +129,21 @@ Unit tests use SQLite in-memory database and don't require external services:
 pytest apps/api/tests -v -m "not integration"
 ```
 
+### Running Migrations
+
+Migrations are managed via Alembic:
+
+```bash
+# Run migrations
+docker-compose exec api alembic upgrade head
+
+# Or manually
+cd apps/api
+alembic upgrade head
+```
+
+**Important:** Always run migrations before starting the API in production.
+
 ## Development
 
 #### Windows Commands
