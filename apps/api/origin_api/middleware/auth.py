@@ -29,15 +29,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Missing API key. Provide x-api-key header."},
             )
 
-        # Get tenant from API key
+        # Get tenant and API key object from API key
         db = SessionLocal()
         try:
-            tenant = get_tenant_by_api_key(db, api_key)
-            if not tenant:
+            result = get_tenant_by_api_key(db, api_key)
+            if not result:
                 return JSONResponse(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={"detail": "Invalid or revoked API key."},
                 )
+            
+            tenant, api_key_obj = result
 
             if tenant.status != "active":
                 return JSONResponse(
@@ -49,9 +51,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.tenant = tenant
             request.state.tenant_id = tenant.id
             
-            # Store API key for scope extraction (if available)
-            if hasattr(tenant, "_api_key_obj"):
-                request.state.api_key_obj = tenant._api_key_obj
+            # Store API key object for scope extraction (no DB scan needed later)
+            if api_key_obj:
+                request.state.api_key_obj = api_key_obj
 
         finally:
             db.close()

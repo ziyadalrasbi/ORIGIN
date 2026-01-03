@@ -28,6 +28,13 @@ class EvidencePack(Base):
     storage_refs = Column(JSON, nullable=True)  # {"json": "object_key", "pdf": "object_key", "html": "object_key"}
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     ready_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=True)
+    
+    # Task tracking for idempotency and stuck detection
+    task_id = Column(String(255), nullable=True, index=True)  # Celery task ID
+    last_enqueued_at = Column(DateTime(timezone=True), nullable=True)  # When task was last enqueued
+    last_polled_at = Column(DateTime(timezone=True), nullable=True)  # When status was last polled
+    started_at = Column(DateTime(timezone=True), nullable=True)  # When task started processing
     
     # Immutability fields
     canonical_json = Column(JSON, nullable=True)  # Immutable EvidencePackV2 JSON snapshot (audience=INTERNAL)

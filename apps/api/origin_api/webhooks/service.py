@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -13,6 +14,7 @@ from origin_api.models import Webhook, WebhookDelivery
 from origin_api.settings import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 class WebhookService:
@@ -62,7 +64,7 @@ class WebhookService:
             try:
                 self._attempt_delivery(webhook, delivery, payload)
             except Exception as e:
-                print(f"Error delivering webhook {webhook.id}: {e}")
+                logger.exception(f"Error delivering webhook {webhook.id}: {e}")
                 delivery.status = "failed"
                 delivery.response_body = str(e)
                 self.db.commit()
@@ -124,7 +126,7 @@ class WebhookService:
                 try:
                     self._attempt_delivery(webhook, delivery, delivery.payload_json)
                 except Exception as e:
-                    print(f"Error retrying webhook {delivery.id}: {e}")
+                    logger.exception(f"Error retrying webhook {delivery.id}: {e}")
 
     def get_dlq_events(self, tenant_id: int, limit: int = 100) -> list[WebhookDelivery]:
         """Get dead-letter queue events (failed after max retries)."""

@@ -99,7 +99,37 @@ curl -X POST http://localhost:8000/v1/evidence-packs \
   }'
 ```
 
-### Development
+### Testing
+
+### Integration Tests
+
+Integration tests require a test database and Redis. Use the provided docker-compose setup:
+
+```bash
+# Start test dependencies
+docker-compose -f docker-compose.test.yml up -d
+
+# Set test database URL
+export TEST_DATABASE_URL=postgresql://origin_test:origin_test_password@localhost:5433/origin_test
+export REDIS_URL=redis://localhost:6380/0
+
+# Run integration tests
+pytest apps/api/tests -v -m integration
+
+# Run all tests (unit + integration)
+pytest apps/api/tests -v
+```
+
+### Unit Tests
+
+Unit tests use SQLite in-memory database and don't require external services:
+
+```bash
+# Run unit tests only
+pytest apps/api/tests -v -m "not integration"
+```
+
+## Development
 
 #### Windows Commands
 

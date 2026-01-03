@@ -27,10 +27,19 @@ def get_celery_app() -> Celery:
     
     Returns:
         Celery app instance
+    
+    Raises:
+        ImportError: If Celery is not available (should return 503 to client)
     """
     global _celery_app
     
     if _celery_app is None:
+        try:
+            from celery import Celery
+        except ImportError:
+            logger.error("Celery not available - evidence pack generation will fail")
+            raise ImportError("Celery not available. Install celery package or configure worker.")
+        
         settings = get_settings()
         
         _celery_app = Celery("origin_api")
@@ -43,8 +52,8 @@ def get_celery_app() -> Celery:
             timezone="UTC",
             enable_utc=True,
             task_track_started=True,
-            task_time_limit=30 * 60,  # 30 minutes
-            task_soft_time_limit=25 * 60,  # 25 minutes
+            task_time_limit=30 * 60,  # 30 minutes (matches worker config)
+            task_soft_time_limit=25 * 60,  # 25 minutes (matches worker config)
         )
         
         logger.info("Initialized Celery client for origin_api")

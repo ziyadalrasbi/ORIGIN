@@ -40,6 +40,7 @@ settings = get_settings()
 
 # Evidence pack timeout (minutes)
 EVIDENCE_PACK_TIMEOUT_MINUTES = settings.evidence_pack_timeout_minutes
+EVIDENCE_PACK_STUCK_THRESHOLD_MINUTES = settings.evidence_pack_stuck_threshold_minutes
 
 
 class EvidencePackRequest(BaseModel):
@@ -73,9 +74,16 @@ class EvidencePackResponse(BaseModel):
     error_message: Optional[str] = None
 
 
-def _get_deterministic_task_id(certificate_id: int, tenant_id: int) -> str:
-    """Generate deterministic task ID for idempotency."""
-    return f"evidence_pack_{certificate_id}_{tenant_id}"
+def _get_idempotency_key(tenant_id: int, certificate_id: int, audience: str, formats: list[str]) -> str:
+    """Generate deterministic idempotency key for evidence pack requests."""
+    sorted_formats = ",".join(sorted(formats))
+    return f"evidence:{tenant_id}:{certificate_id}:{audience}:{sorted_formats}"
+
+
+def _get_deterministic_task_id(certificate_id: int, tenant_id: int, audience: str, formats: list[str]) -> str:
+    """Generate deterministic task ID for Celery task (includes audience and formats for uniqueness)."""
+    sorted_formats = ",".join(sorted(formats))
+    return f"evidence_pack_{certificate_id}_{tenant_id}_{audience}_{sorted_formats}"
 
 
 def _upsert_evidence_pack(
@@ -239,63 +247,164 @@ async def request_evidence_pack(
             detail=f"Invalid format(s). Allowed: {allowed_formats}",
         )
     
-    # Check if evidence pack already exists and is ready
-    existing = (
+    # Use SELECT FOR UPDATE for atomic idempotency check
+    # This prevents race conditions when multiple requests come in simultaneously
+    now = datetime.now(timezone.utc)
+    stuck_threshold = timedelta(minutes=EVIDENCE_PACK_STUCK_THRESHOLD_MINUTES)
+    
+    evidence_pack = (
         db.query(EvidencePack)
         .filter(
             EvidencePack.tenant_id == tenant.id,
             EvidencePack.certificate_id == certificate.id,
             EvidencePack.audience == determined_audience,
         )
+        .with_for_update()
         .first()
     )
     
-    if existing and existing.status == "ready":
-        # Check if all requested formats are available
-        existing_formats = existing.formats or []
-        if set(formats) <= set(existing_formats):
-            # All formats available, return ready status
-            return _build_response(existing, certificate.certificate_id, db)
+    if evidence_pack:
+        # Evidence pack exists - check status
+        if evidence_pack.status == "ready":
+            # Check if all requested formats are available
+            existing_formats = evidence_pack.formats or []
+            if set(formats) <= set(existing_formats):
+                # All formats available, return ready status
+                logger.info(
+                    f"Evidence pack already ready with requested formats",
+                    extra={
+                        "correlation_id": correlation_id,
+                        "certificate_id": certificate.certificate_id,
+                        "tenant_id": tenant.id,
+                        "audience": determined_audience,
+                        "formats": formats,
+                    },
+                )
+                return _build_response(evidence_pack, certificate.certificate_id, db)
+        
+        # Check if task is stuck or should be re-enqueued
+        if evidence_pack.status in ("pending", "processing"):
+            if evidence_pack.last_enqueued_at:
+                time_since_enqueue = now - evidence_pack.last_enqueued_at.replace(tzinfo=timezone.utc)
+                if time_since_enqueue < stuck_threshold:
+                    # Not stuck yet - return pending without re-enqueueing
+                    logger.info(
+                        f"Evidence pack generation in progress, not stuck yet",
+                        extra={
+                            "correlation_id": correlation_id,
+                            "certificate_id": certificate.certificate_id,
+                            "tenant_id": tenant.id,
+                            "status": evidence_pack.status,
+                            "time_since_enqueue_minutes": time_since_enqueue.total_seconds() / 60,
+                            "task_id": evidence_pack.task_id,
+                        },
+                    )
+                    return EvidencePackResponse(
+                        status="pending",
+                        certificate_id=request_data.certificate_id,
+                        audience=determined_audience,
+                        formats=formats,
+                        poll_url=f"/v1/evidence-packs/{request_data.certificate_id}",
+                        retry_after_seconds=30,
+                        task_state=evidence_pack.task_id if evidence_pack.task_id else None,
+                    )
+                # Stuck - will re-enqueue below
+                logger.warning(
+                    f"Evidence pack task stuck, re-enqueueing",
+                    extra={
+                        "correlation_id": correlation_id,
+                        "certificate_id": certificate.certificate_id,
+                        "tenant_id": tenant.id,
+                        "time_since_enqueue_minutes": time_since_enqueue.total_seconds() / 60,
+                        "task_id": evidence_pack.task_id,
+                    },
+                )
+        
+        # Update existing record
+        evidence_pack.status = "pending"
+        evidence_pack.formats = formats
+        evidence_pack.error_code = None
+        evidence_pack.error_message = None
+        evidence_pack.updated_at = now
+    else:
+        # Create new evidence pack record
+        evidence_pack = EvidencePack(
+            tenant_id=tenant.id,
+            certificate_id=certificate.id,
+            audience=determined_audience,
+            status="pending",
+            formats=formats,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(evidence_pack)
     
-    # Upsert evidence pack record (idempotent)
-    evidence_pack = _upsert_evidence_pack(
-        db=db,
-        tenant_id=tenant.id,
-        certificate_id=certificate.id,
-        audience=determined_audience,
-        status="pending",
-        formats=formats,
-    )
+    # Generate task ID and enqueue
+    task_id = _get_deterministic_task_id(certificate.id, tenant.id, determined_audience, formats)
     
-    # Enqueue Celery task
-    celery_app = get_celery_app()
-    task_id = _get_deterministic_task_id(certificate.id, tenant.id)
-    
-    # Check if task is already running
-    from celery.result import AsyncResult
-    
-    existing_task = AsyncResult(task_id, app=celery_app)
-    task_state = existing_task.state
-    
-    if task_state in ("STARTED", "RETRY"):
-        # Task already running, return pending
-        logger.info(
-            f"Evidence pack task already running: {task_id} (state={task_state})",
+    # Try to get Celery app (may raise ImportError)
+    try:
+        celery_app = get_celery_app()
+    except ImportError as e:
+        # Celery not available - return 503
+        logger.error(
+            f"Celery unavailable, cannot enqueue evidence pack task: {e}",
             extra={
                 "correlation_id": correlation_id,
                 "certificate_id": certificate.certificate_id,
                 "tenant_id": tenant.id,
+                "audience": determined_audience,
+                "formats": formats,
             },
+            exc_info=True,
         )
+        evidence_pack.status = "failed"
+        evidence_pack.error_code = "CELERY_UNAVAILABLE"
+        evidence_pack.error_message = "Evidence pack generation service unavailable (Celery/worker not configured)"
+        evidence_pack.updated_at = now
+        db.commit()
+        
         return EvidencePackResponse(
-            status="pending",
+            status="failed",
             certificate_id=request_data.certificate_id,
             audience=determined_audience,
             formats=formats,
-            poll_url=f"/v1/evidence-packs/{request_data.certificate_id}",
-            retry_after_seconds=30,
-            task_state=task_state,
+            error_code="CELERY_UNAVAILABLE",
+            error_message="Evidence pack generation service unavailable (Celery/worker not configured)",
         )
+    
+    # Check if task is already running (using stored task_id)
+    from celery.result import AsyncResult
+    
+    if evidence_pack.task_id:
+        existing_task = AsyncResult(evidence_pack.task_id, app=celery_app)
+        task_state = existing_task.state
+        
+        if task_state in ("STARTED", "RETRY", "PENDING"):
+            # Task already running or queued - return pending without re-enqueueing
+            logger.info(
+                f"Evidence pack task already in progress: {evidence_pack.task_id} (state={task_state})",
+                extra={
+                    "correlation_id": correlation_id,
+                    "certificate_id": certificate.certificate_id,
+                    "tenant_id": tenant.id,
+                    "task_id": evidence_pack.task_id,
+                },
+            )
+            # Update last_polled_at for telemetry
+            evidence_pack.last_polled_at = now
+            evidence_pack.updated_at = now
+            db.commit()
+            
+            return EvidencePackResponse(
+                status="pending",
+                certificate_id=request_data.certificate_id,
+                audience=determined_audience,
+                formats=formats,
+                poll_url=f"/v1/evidence-packs/{request_data.certificate_id}",
+                retry_after_seconds=30,
+                task_state=task_state,
+            )
     
     # Enqueue new task
     try:
@@ -306,6 +415,12 @@ async def request_evidence_pack(
         )
         task = task_signature.apply_async()
         
+        # Update evidence pack with task tracking
+        evidence_pack.task_id = task_id
+        evidence_pack.last_enqueued_at = now
+        evidence_pack.updated_at = now
+        db.commit()
+        
         logger.info(
             f"Enqueued evidence pack generation task: {task.id}",
             extra={
@@ -314,27 +429,64 @@ async def request_evidence_pack(
                 "tenant_id": tenant.id,
                 "audience": determined_audience,
                 "formats": formats,
+                "task_id": task_id,
             },
         )
+    except ImportError as e:
+        # Celery or worker not available - return 503 Service Unavailable
+        logger.error(
+            f"Celery unavailable, cannot enqueue evidence pack task: {e}",
+            extra={
+                "correlation_id": correlation_id,
+                "certificate_id": certificate.certificate_id,
+                "tenant_id": tenant.id,
+                "audience": determined_audience,
+                "formats": formats,
+            },
+            exc_info=True,
+        )
+        # Update status to failed
+        evidence_pack.status = "failed"
+        evidence_pack.error_code = "CELERY_UNAVAILABLE"
+        evidence_pack.error_message = "Evidence pack generation service unavailable (Celery/worker not configured)"
+        evidence_pack.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        
+        return EvidencePackResponse(
+            status="failed",
+            certificate_id=request_data.certificate_id,
+            audience=determined_audience,
+            formats=formats,
+            error_code="CELERY_UNAVAILABLE",
+            error_message="Evidence pack generation service unavailable (Celery/worker not configured)",
+        )
     except Exception as e:
+        # Other errors (broker misconfigured, etc.) - return 503
         logger.error(
             f"Failed to enqueue evidence pack task: {e}",
             extra={
                 "correlation_id": correlation_id,
                 "certificate_id": certificate.certificate_id,
                 "tenant_id": tenant.id,
+                "audience": determined_audience,
+                "formats": formats,
             },
             exc_info=True,
         )
         # Update status to failed
         evidence_pack.status = "failed"
         evidence_pack.error_code = "TASK_ENQUEUE_FAILED"
-        evidence_pack.error_message = "Failed to enqueue generation task"
+        evidence_pack.error_message = f"Failed to enqueue generation task: {str(e)[:200]}"
+        evidence_pack.updated_at = datetime.now(timezone.utc)
         db.commit()
         
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to enqueue evidence pack generation",
+        return EvidencePackResponse(
+            status="failed",
+            certificate_id=request_data.certificate_id,
+            audience=determined_audience,
+            formats=formats,
+            error_code="TASK_ENQUEUE_FAILED",
+            error_message=f"Failed to enqueue generation task: {str(e)[:200]}",
         )
     
     return EvidencePackResponse(
@@ -408,52 +560,98 @@ async def get_evidence_pack(
     # Enforce audience access
     enforce_audience_access("download", scopes, determined_audience, evidence_pack.audience)
     
+    # Update last_polled_at for telemetry
+    now = datetime.now(timezone.utc)
+    evidence_pack.last_polled_at = now
+    evidence_pack.updated_at = now
+    db.commit()
+    
     # If pending, check Celery task status
     if evidence_pack.status == "pending":
-        celery_app = get_celery_app()
-        task_id = _get_deterministic_task_id(certificate.id, tenant.id)
+        # Try to get Celery app (may raise ImportError)
+        try:
+            celery_app = get_celery_app()
+        except ImportError:
+            # Celery not available - return pending with error info
+            logger.warning(
+                f"Celery unavailable during poll, evidence pack may be stuck",
+                extra={
+                    "correlation_id": correlation_id,
+                    "certificate_id": certificate_id,
+                    "tenant_id": tenant.id,
+                    "task_id": evidence_pack.task_id,
+                },
+            )
+            return EvidencePackResponse(
+                status="pending",
+                certificate_id=certificate_id,
+                audience=evidence_pack.audience,
+                formats=evidence_pack.formats or [],
+                poll_url=f"/v1/evidence-packs/{certificate_id}",
+                retry_after_seconds=30,
+                error_code="CELERY_UNAVAILABLE",
+                error_message="Evidence pack generation service unavailable",
+            )
+        
+        task_id = evidence_pack.task_id or _get_deterministic_task_id(certificate.id, tenant.id, evidence_pack.audience, evidence_pack.formats or [])
         
         from celery.result import AsyncResult
         
         task_result = AsyncResult(task_id, app=celery_app)
         task_state = task_result.state
         
-        # Check if task has been pending too long
-        time_elapsed = datetime.now(timezone.utc) - evidence_pack.created_at.replace(tzinfo=timezone.utc)
-        if time_elapsed > timedelta(minutes=EVIDENCE_PACK_TIMEOUT_MINUTES):
-            if task_state in ("PENDING", "STARTED"):
-                # Task stuck - re-enqueue with new task_id
-                logger.warning(
-                    f"Evidence pack task stuck for {time_elapsed}, re-enqueueing",
-                    extra={
-                        "correlation_id": correlation_id,
-                        "certificate_id": certificate_id,
-                        "task_id": task_id,
-                        "task_state": task_state,
-                    },
-                )
-                
-                # Re-enqueue with timestamp suffix
-                retry_task_id = f"{task_id}_retry_{int(datetime.now(timezone.utc).timestamp())}"
-                try:
-                    task_signature = celery_app.signature(
-                        "origin_worker.tasks.generate_evidence_pack",
-                        args=[certificate.certificate_id, tenant.id, evidence_pack.formats or [], evidence_pack.audience],
-                        task_id=retry_task_id,
+        # Check if task has been pending too long (stuck detection)
+        if evidence_pack.last_enqueued_at:
+            time_since_enqueue = now - evidence_pack.last_enqueued_at.replace(tzinfo=timezone.utc)
+            if time_since_enqueue > stuck_threshold:
+                if task_state in ("PENDING", "STARTED"):
+                    # Task stuck - re-enqueue with new task_id
+                    logger.warning(
+                        f"Evidence pack task stuck for {time_since_enqueue}, re-enqueueing",
+                        extra={
+                            "correlation_id": correlation_id,
+                            "certificate_id": certificate_id,
+                            "task_id": task_id,
+                            "task_state": task_state,
+                            "time_since_enqueue_minutes": time_since_enqueue.total_seconds() / 60,
+                        },
                     )
-                    task_signature.apply_async()
                     
-                    return EvidencePackResponse(
-                        status="pending",
-                        certificate_id=certificate_id,
-                        audience=evidence_pack.audience,
-                        formats=evidence_pack.formats,
-                        poll_url=f"/v1/evidence-packs/{certificate_id}",
-                        retry_after_seconds=30,
-                        task_state="stuck_requeued",
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to re-enqueue stuck task: {e}", exc_info=True)
+                    # Re-enqueue with timestamp suffix
+                    retry_task_id = f"{task_id}_retry_{int(now.timestamp())}"
+                    try:
+                        task_signature = celery_app.signature(
+                            "origin_worker.tasks.generate_evidence_pack",
+                            args=[certificate.certificate_id, tenant.id, evidence_pack.formats or [], evidence_pack.audience],
+                            task_id=retry_task_id,
+                        )
+                        task_signature.apply_async()
+                        
+                        # Update task tracking
+                        evidence_pack.task_id = retry_task_id
+                        evidence_pack.last_enqueued_at = now
+                        evidence_pack.updated_at = now
+                        db.commit()
+                        
+                        return EvidencePackResponse(
+                            status="pending",
+                            certificate_id=certificate_id,
+                            audience=evidence_pack.audience,
+                            formats=evidence_pack.formats,
+                            poll_url=f"/v1/evidence-packs/{certificate_id}",
+                            retry_after_seconds=30,
+                            task_state="stuck_requeued",
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to re-enqueue stuck task: {e}",
+                            extra={
+                                "correlation_id": correlation_id,
+                                "certificate_id": certificate_id,
+                                "task_id": task_id,
+                            },
+                            exc_info=True,
+                        )
         
         # Update DB from task result if available
         if task_state == "SUCCESS":
@@ -463,9 +661,10 @@ async def get_evidence_pack(
                 evidence_pack.status = "ready"
                 evidence_pack.storage_refs = task_data.get("storage_refs", {})
                 evidence_pack.formats = task_data.get("formats", [])
-                evidence_pack.ready_at = datetime.now(timezone.utc)
+                evidence_pack.ready_at = now
                 evidence_pack.error_code = None
                 evidence_pack.error_message = None
+                evidence_pack.updated_at = now
                 db.commit()
                 
                 logger.info(
@@ -473,6 +672,9 @@ async def get_evidence_pack(
                     extra={
                         "correlation_id": correlation_id,
                         "certificate_id": certificate_id,
+                        "tenant_id": tenant.id,
+                        "audience": evidence_pack.audience,
+                        "task_id": task_id,
                     },
                 )
         
@@ -484,6 +686,7 @@ async def get_evidence_pack(
             evidence_pack.status = "failed"
             evidence_pack.error_code = "GENERATION_FAILED"
             evidence_pack.error_message = error_message[:500]  # Sanitize length
+            evidence_pack.updated_at = now
             db.commit()
             
             logger.warning(
@@ -491,6 +694,9 @@ async def get_evidence_pack(
                 extra={
                     "correlation_id": correlation_id,
                     "certificate_id": certificate_id,
+                    "tenant_id": tenant.id,
+                    "audience": evidence_pack.audience,
+                    "task_id": task_id,
                 },
             )
         

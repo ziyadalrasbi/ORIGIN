@@ -1,6 +1,7 @@
 """Seed data for development and testing."""
 
 import hashlib
+import logging
 from datetime import datetime, timedelta
 
 from passlib.context import CryptContext
@@ -13,6 +14,7 @@ from origin_api.models import (
     Tenant,
 )
 
+logger = logging.getLogger(__name__)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -100,10 +102,10 @@ def seed_tenants(db: Session):
         demo_tenant.policy_profile_id = policy_profile.id
 
         db.commit()
-        print(f"✓ Created demo tenant: {demo_tenant.label} (ID: {demo_tenant.id})")
-        print(f"  API Key: demo-api-key-12345")
+        logger.info(f"✓ Created demo tenant: {demo_tenant.label} (ID: {demo_tenant.id})")
+        logger.info(f"  API Key: demo-api-key-12345")
     else:
-        print(f"✓ Demo tenant already exists: {demo_tenant.label}")
+        logger.info(f"✓ Demo tenant already exists: {demo_tenant.label}")
 
     # Test tenant
     test_tenant = db.query(Tenant).filter(Tenant.label == "test").first()
@@ -175,10 +177,10 @@ def seed_tenants(db: Session):
         test_tenant.policy_profile_id = policy_profile.id
 
         db.commit()
-        print(f"✓ Created test tenant: {test_tenant.label} (ID: {test_tenant.id})")
-        print(f"  API Key: test-api-key-67890")
+        logger.info(f"✓ Created test tenant: {test_tenant.label} (ID: {test_tenant.id})")
+        logger.info(f"  API Key: test-api-key-67890")
     else:
-        print(f"✓ Test tenant already exists: {test_tenant.label}")
+        logger.info(f"✓ Test tenant already exists: {test_tenant.label}")
 
 
 def seed_accounts(db: Session):
@@ -205,17 +207,17 @@ def seed_accounts(db: Session):
                 **acc_data,
             )
             db.add(account)
-            print(f"✓ Created account: {acc_data['external_id']}")
+            logger.info(f"✓ Created account: {acc_data['external_id']}")
         else:
-            print(f"✓ Account already exists: {acc_data['external_id']}")
+            logger.info(f"✓ Account already exists: {acc_data['external_id']}")
 
     db.commit()
 
 
 def seed_all(db: Session):
     """Seed all data."""
-    print("Seeding database...")
+    logger.info("Seeding database...")
     seed_tenants(db)
     seed_accounts(db)
-    print("✓ Seeding complete!")
+    logger.info("✓ Seeding complete!")
 

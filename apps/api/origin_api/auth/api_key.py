@@ -35,8 +35,14 @@ def verify_api_key(api_key: str, hashed: str) -> bool:
         return False
 
 
-def get_tenant_by_api_key(db: Session, api_key: str) -> Optional[Tenant]:
-    """Get tenant by API key."""
+def get_tenant_by_api_key(db: Session, api_key: str) -> Optional[tuple[Tenant, Optional[APIKey]]]:
+    """
+    Get tenant and API key object by API key.
+    
+    Returns:
+        Tuple of (Tenant, APIKey) or (Tenant, None) for legacy keys.
+        Returns None if not found.
+    """
     # Find active API key
     api_key_objs = (
         db.query(APIKey)
@@ -52,15 +58,14 @@ def get_tenant_by_api_key(db: Session, api_key: str) -> Optional[Tenant]:
         if verify_api_key(api_key, key_obj.hash):
             tenant = db.query(Tenant).filter(Tenant.id == key_obj.tenant_id).first()
             if tenant:
-                # Store API key object in tenant for scope access (hack via attribute)
-                tenant._api_key_obj = key_obj  # Store for scope extraction
-            return tenant
+                return (tenant, key_obj)
+            return None
 
     # Fallback: check tenant's api_key_hash (legacy)
     tenants = db.query(Tenant).filter(Tenant.status == "active").all()
     for tenant in tenants:
         if verify_api_key(api_key, tenant.api_key_hash):
-            return tenant
+            return (tenant, None)  # Legacy key, no APIKey object
 
     return None
 

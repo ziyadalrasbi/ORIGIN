@@ -26,43 +26,44 @@ EVIDENCE_SCOPES = {
 }
 
 
-def get_api_key_scopes(request: Request, db) -> list[str]:
+def get_api_key_scopes(request: Request, db=None) -> list[str]:
     """
     Extract API key scopes from request.
     
+    Uses request.state.api_key_obj (set by AuthMiddleware) to avoid DB scanning.
     Returns empty list if scopes not available (backward compatibility).
+    
+    Args:
+        request: FastAPI Request object
+        db: Optional DB session (not used, kept for backward compatibility)
+    
+    Returns:
+        List of scope strings
     """
-    api_key = request.headers.get("x-api-key")
-    if not api_key:
+    # Read from request state (set by AuthMiddleware)
+    api_key_obj = getattr(request.state, "api_key_obj", None)
+    
+    if not api_key_obj:
+        # No API key object available (legacy key or not authenticated)
+        return []
+    
+    if not api_key_obj.scopes:
         return []
     
     try:
-        from origin_api.auth.api_key import verify_api_key
-        from origin_api.models import APIKey
-        
-        # Find API key object
-        api_key_objs = (
-            db.query(APIKey)
-            .filter(
-                APIKey.is_active == True,  # noqa: E712
-                APIKey.revoked_at.is_(None),
-            )
-            .all()
-        )
-        
-        for key_obj in api_key_objs:
-            if verify_api_key(api_key, key_obj.hash):
-                if key_obj.scopes:
-                    try:
-                        return json.loads(key_obj.scopes) if isinstance(key_obj.scopes, str) else key_obj.scopes
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"Invalid scopes format for API key {key_obj.id}")
-                        return []
-                return []
-        
+        # Parse scopes (can be JSON string or already a list)
+        if isinstance(api_key_obj.scopes, str):
+            return json.loads(api_key_obj.scopes)
+        elif isinstance(api_key_obj.scopes, list):
+            return api_key_obj.scopes
+        else:
+            logger.warning(f"Invalid scopes type for API key {api_key_obj.id}: {type(api_key_obj.scopes)}")
+            return []
+    except json.JSONDecodeError as e:
+        logger.warning(f"Invalid scopes JSON for API key {api_key_obj.id}: {e}")
         return []
     except Exception as e:
-        logger.debug(f"Error extracting API key scopes: {e}")
+        logger.warning(f"Error parsing scopes for API key {api_key_obj.id}: {e}")
         return []
 
 
