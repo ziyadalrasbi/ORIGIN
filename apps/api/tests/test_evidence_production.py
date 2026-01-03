@@ -100,7 +100,7 @@ class TestEvidenceIdempotency:
         # Mock API key verification
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 # Make two concurrent requests
                 def make_request():
@@ -148,7 +148,7 @@ class TestEvidencePolling:
         
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 # Request evidence pack
                 response = client.post(
@@ -195,7 +195,7 @@ class TestEvidencePolling:
         
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 # Poll - should detect stuck and re-enqueue
                 poll_response = client.get(
@@ -231,7 +231,7 @@ class TestEvidencePolling:
         
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 # Poll for status
                 poll_response = client.get(
@@ -270,7 +270,7 @@ class TestAudienceEnforcement:
         # Mock API key with DSP scopes
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 # Try to fetch with DSP scopes (should fail)
                 with patch("origin_api.evidence.scopes.get_api_key_scopes") as mock_scopes:
@@ -293,7 +293,7 @@ class TestAudienceEnforcement:
         # Mock API key with INTERNAL scopes only
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 with patch("origin_api.evidence.scopes.get_api_key_scopes") as mock_scopes:
                     mock_scopes.return_value = ["evidence:request:internal", "evidence:download:internal"]
@@ -347,7 +347,7 @@ class TestSignedURLs:
         
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 # Mock storage service to return presigned URLs
                 with patch("origin_api.storage.service.get_storage_service") as mock_storage:
@@ -395,7 +395,7 @@ class TestResponsePayload:
         
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 response = client.get(
                     f"/v1/evidence-packs/{certificate.certificate_id}",
@@ -429,7 +429,7 @@ class TestResponsePayload:
         
         with patch("origin_api.auth.api_key.verify_api_key", return_value=True):
             with patch("origin_api.auth.api_key.get_tenant_by_api_key") as mock_get_tenant:
-                mock_get_tenant.return_value = tenant
+                mock_get_tenant.return_value = (tenant, None)  # Legacy key, no APIKey object
                 
                 response = client.get(
                     f"/v1/evidence-packs/{certificate.certificate_id}",

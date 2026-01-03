@@ -1,5 +1,6 @@
 """Pytest configuration and fixtures for integration tests."""
 
+import json
 import os
 import pytest
 from sqlalchemy import create_engine
@@ -62,9 +63,10 @@ def test_tenant(db: Session) -> Tenant:
 
 @pytest.fixture
 def test_api_key(db: Session, test_tenant: Tenant) -> APIKey:
-    """Create a test API key with scopes."""
+    """Create a test API key with scopes (legacy format, no public_id)."""
     api_key = APIKey(
         tenant_id=test_tenant.id,
+        public_id=None,  # Legacy key format
         hash="hashed-test-key",
         label="test-key",
         scopes=json.dumps(["evidence:request:internal", "evidence:download:internal"]),

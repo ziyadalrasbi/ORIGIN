@@ -55,7 +55,14 @@ class EvidencePackRequest(BaseModel):
 
 
 class EvidencePackResponse(BaseModel):
-    """Evidence pack status response."""
+    """Evidence pack status response.
+    
+    Task field semantics:
+    - task_id: Celery task ID (hash-based, deterministic)
+    - task_status: ONLY Celery task states (PENDING, STARTED, RETRY, SUCCESS, FAILURE) or None if unknown
+    - task_state: Deprecated, always mirrors task_status for backward compatibility
+    - pipeline_event: Custom pipeline events (STUCK_REQUEUED, ENQUEUED, etc.) - separate from task_status
+    """
 
     status: str  # not_found, pending, ready, failed
     certificate_id: str
@@ -70,10 +77,11 @@ class EvidencePackResponse(BaseModel):
     ready_at: Optional[str] = None  # ISO8601 timestamp
     poll_url: Optional[str] = None
     retry_after_seconds: Optional[int] = None
-    task_id: Optional[str] = None  # Celery task ID
-    task_status: Optional[str] = None  # PENDING, STARTED, SUCCESS, FAILURE, RETRY
-    task_state: Optional[str] = None  # Deprecated: use task_status. Kept for backward compatibility.
-    error_code: Optional[str] = None
+    task_id: Optional[str] = None  # Celery task ID (hash-based, deterministic)
+    task_status: Optional[str] = None  # ONLY: PENDING, STARTED, RETRY, SUCCESS, FAILURE, or None if unknown
+    task_state: Optional[str] = None  # Deprecated: always mirrors task_status for backward compatibility
+    pipeline_event: Optional[str] = None  # Custom pipeline events: STUCK_REQUEUED, ENQUEUED, POLLING, UPDATED_FROM_TASK_RESULT
+    error_code: Optional[str] = None  # Set for transient infra failures (broker down) or permanent failures
     error_message: Optional[str] = None
 
 
@@ -94,6 +102,78 @@ def _get_deterministic_task_id(certificate_id: int, tenant_id: int, audience: st
     idempotency_key = _get_idempotency_key(tenant_id, certificate_id, audience, formats)
     hash_digest = hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]
     return f"evidence_pack_{hash_digest}"
+
+
+def _pending_response(
+    certificate_id: str,
+    audience: str,
+    formats: list[str],
+    task_id: Optional[str] = None,
+    task_status: Optional[str] = None,
+    pipeline_event: Optional[str] = None,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+    retry_after: int = 30,
+) -> JSONResponse:
+    """
+    Create consistent pending response (HTTP 202 Accepted).
+    
+    All pending responses use 202 Accepted + Retry-After header for consistency.
+    """
+    content = {
+        "status": "pending",
+        "certificate_id": certificate_id,
+        "audience": audience,
+        "formats": formats,
+        "poll_url": f"/v1/evidence-packs/{certificate_id}",
+        "retry_after_seconds": retry_after,
+    }
+    
+    if task_id:
+        content["task_id"] = task_id
+    if task_status:
+        content["task_status"] = task_status
+        content["task_state"] = task_status  # Mirror for backward compatibility
+    if pipeline_event:
+        content["pipeline_event"] = pipeline_event
+    if error_code:
+        content["error_code"] = error_code
+    if error_message:
+        content["error_message"] = error_message
+    
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content=content,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _failed_response(
+    certificate_id: str,
+    audience: str,
+    formats: list[str],
+    error_code: str,
+    error_message: str,
+    retry_after: int = 30,
+) -> JSONResponse:
+    """
+    Create consistent failed response (HTTP 503 Service Unavailable for infra failures).
+    
+    Used for transient infrastructure failures (broker down, Celery unavailable).
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "status": "pending",  # Keep as pending for transient failures
+            "certificate_id": certificate_id,
+            "audience": audience,
+            "formats": formats,
+            "error_code": error_code,
+            "error_message": error_message,
+            "retry_after_seconds": retry_after,
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 def _upsert_evidence_pack(
@@ -226,7 +306,7 @@ async def request_evidence_pack(
     correlation_id = getattr(request.state, "correlation_id", None)
     
     # Extract API key scopes and determine audience
-    scopes = get_api_key_scopes(request, db)
+    scopes = get_api_key_scopes(request)
     determined_audience = determine_audience_from_scopes(scopes, request_data.audience)
     
     # Enforce audience access for request
@@ -309,22 +389,14 @@ async def request_evidence_pack(
                             "task_id": evidence_pack.task_id,
                         },
                     )
-                    # task_status should mirror task_state (not task_id)
-                    response_data = {
-                        "status": "pending",
-                        "certificate_id": request_data.certificate_id,
-                        "audience": determined_audience,
-                        "formats": formats,
-                        "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
-                        "retry_after_seconds": 30,
-                        "task_id": evidence_pack.task_id,
-                        "task_status": None,  # Celery unavailable, status unknown
-                        "task_state": None,  # Backward compatibility: mirrors task_status
-                    }
-                    return JSONResponse(
-                        status_code=status.HTTP_202_ACCEPTED,
-                        content=response_data,
-                        headers={"Retry-After": "30"},
+                    # Return consistent pending response
+                    return _pending_response(
+                        certificate_id=request_data.certificate_id,
+                        audience=determined_audience,
+                        formats=formats,
+                        task_id=evidence_pack.task_id,
+                        task_status=None,  # Celery unavailable, status unknown
+                        pipeline_event="POLLING",
                     )
                 # Stuck - will re-enqueue below
                 logger.warning(
@@ -376,22 +448,19 @@ async def request_evidence_pack(
             },
             exc_info=True,
         )
-        evidence_pack.status = "failed"
+        # Keep status as pending for transient failure (allows retry)
+        evidence_pack.status = "pending"
         evidence_pack.error_code = "CELERY_UNAVAILABLE"
-        evidence_pack.error_message = "Evidence pack generation service unavailable (Celery/worker not configured)"
+        evidence_pack.error_message = "Evidence pack generation service unavailable (Celery not installed)"
         evidence_pack.updated_at = now
         db.commit()
         
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "status": "failed",
-                "certificate_id": request_data.certificate_id,
-                "audience": determined_audience,
-                "formats": formats,
-                "error_code": "CELERY_UNAVAILABLE",
-                "error_message": "Evidence pack generation service unavailable (Celery/worker not configured)",
-            },
+        return _failed_response(
+            certificate_id=request_data.certificate_id,
+            audience=determined_audience,
+            formats=formats,
+            error_code="CELERY_UNAVAILABLE",
+            error_message="Evidence pack generation service unavailable (Celery not installed)",
         )
     
     # Check if task is already running (using stored task_id)
@@ -417,21 +486,14 @@ async def request_evidence_pack(
             evidence_pack.updated_at = now
             db.commit()
             
-            response_data = {
-                "status": "pending",
-                "certificate_id": request_data.certificate_id,
-                "audience": determined_audience,
-                "formats": formats,
-                "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
-                "retry_after_seconds": 30,
-                "task_id": evidence_pack.task_id,
-                "task_status": task_state,  # Celery state: PENDING/STARTED/RETRY
-                "task_state": task_state,  # Backward compatibility: mirrors task_status
-            }
-            return JSONResponse(
-                status_code=status.HTTP_202_ACCEPTED,
-                content=response_data,
-                headers={"Retry-After": "30"},
+            # Return consistent pending response with Celery task status
+            return _pending_response(
+                certificate_id=request_data.certificate_id,
+                audience=determined_audience,
+                formats=formats,
+                task_id=evidence_pack.task_id,
+                task_status=task_state,  # Celery state: PENDING/STARTED/RETRY
+                pipeline_event="POLLING",
             )
     
     # Enqueue new task
@@ -473,24 +535,19 @@ async def request_evidence_pack(
             },
             exc_info=True,
         )
-        # Update status to failed
-        evidence_pack.status = "failed"
+        # Keep status as pending for transient failure (allows retry)
+        evidence_pack.status = "pending"
         evidence_pack.error_code = "BROKER_UNAVAILABLE"
         evidence_pack.error_message = "Broker unavailable (connection/timeout error)"
         evidence_pack.updated_at = now
         db.commit()
         
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "status": "failed",
-                "certificate_id": request_data.certificate_id,
-                "audience": determined_audience,
-                "formats": formats,
-                "error_code": "BROKER_UNAVAILABLE",
-                "error_message": "Broker unavailable (connection/timeout error)",
-            },
-            headers={"Retry-After": "30"},
+        return _failed_response(
+            certificate_id=request_data.certificate_id,
+            audience=determined_audience,
+            formats=formats,
+            error_code="BROKER_UNAVAILABLE",
+            error_message="Broker unavailable (connection/timeout error)",
         )
     except Exception as broker_error:
         # Check if it's a kombu/broker error
@@ -516,23 +573,19 @@ async def request_evidence_pack(
                 },
                 exc_info=True,
             )
-            evidence_pack.status = "failed"
+            # Keep status as pending for transient failure (allows retry)
+            evidence_pack.status = "pending"
             evidence_pack.error_code = "BROKER_UNAVAILABLE"
             evidence_pack.error_message = f"Broker error: {str(broker_error)[:200]}"
             evidence_pack.updated_at = now
             db.commit()
             
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "status": "failed",
-                    "certificate_id": request_data.certificate_id,
-                    "audience": determined_audience,
-                    "formats": formats,
-                    "error_code": "BROKER_UNAVAILABLE",
-                    "error_message": f"Broker error: {str(broker_error)[:200]}",
-                },
-                headers={"Retry-After": "30"},
+            return _failed_response(
+                certificate_id=request_data.certificate_id,
+                audience=determined_audience,
+                formats=formats,
+                error_code="BROKER_UNAVAILABLE",
+                error_message=f"Broker error: {str(broker_error)[:200]}",
             )
         
         # Re-raise if not a broker error (will be caught by outer exception handler)
@@ -571,21 +624,13 @@ async def request_evidence_pack(
         )
     
     # Task successfully enqueued
-    response_data = {
-        "status": "pending",
-        "certificate_id": request_data.certificate_id,
-        "audience": determined_audience,
-        "formats": formats,
-        "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
-        "retry_after_seconds": 30,
-        "task_id": task_id,
-        "task_status": "PENDING",
-        "task_state": "PENDING",  # Backward compatibility: mirrors task_status
-    }
-    return JSONResponse(
-        status_code=status.HTTP_202_ACCEPTED,
-        content=response_data,
-        headers={"Retry-After": "30"},
+    return _pending_response(
+        certificate_id=request_data.certificate_id,
+        audience=determined_audience,
+        formats=formats,
+        task_id=task_id,
+        task_status="PENDING",  # Task is queued, awaiting worker pickup
+        pipeline_event="ENQUEUED",
     )
 
 
@@ -609,7 +654,7 @@ async def get_evidence_pack(
     correlation_id = getattr(request.state, "correlation_id", None)
     
     # Extract scopes to determine allowed audience
-    scopes = get_api_key_scopes(request, db)
+    scopes = get_api_key_scopes(request)
     
     # Find certificate
     certificate = (
@@ -881,7 +926,7 @@ async def download_evidence_pack(
     tenant: Tenant = request.state.tenant
     
     # Extract scopes and determine audience
-    scopes = get_api_key_scopes(request, db)
+    scopes = get_api_key_scopes(request)
     determined_audience = determine_audience_from_scopes(scopes)
     
     # Find certificate

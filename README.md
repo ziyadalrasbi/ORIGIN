@@ -90,6 +90,7 @@ curl -X POST http://localhost:8000/v1/ingest \
 After an ingest, request an evidence pack:
 
 ```bash
+# Request evidence pack generation
 curl -X POST http://localhost:8000/v1/evidence-packs \
   -H "x-api-key: demo-api-key-12345" \
   -H "Content-Type: application/json" \
@@ -97,16 +98,74 @@ curl -X POST http://localhost:8000/v1/evidence-packs \
     "certificate_id": "<certificate_id_from_ingest>",
     "format": "json,pdf,html"
   }'
+
+# Response: HTTP 202 Accepted
+# {
+#   "status": "pending",
+#   "certificate_id": "...",
+#   "task_id": "evidence_pack_...",
+#   "task_status": "PENDING",
+#   "pipeline_event": "ENQUEUED",
+#   "poll_url": "/v1/evidence-packs/{certificate_id}",
+#   "retry_after_seconds": 30
+# }
+
+# Poll for status (use Retry-After header for backoff)
+curl -X GET http://localhost:8000/v1/evidence-packs/{certificate_id} \
+  -H "x-api-key: demo-api-key-12345"
+
+# Response when ready: HTTP 200 OK
+# {
+#   "status": "ready",
+#   "certificate_id": "...",
+#   "signed_urls": {"json": "...", "pdf": "...", "html": "..."},
+#   "task_status": "SUCCESS",
+#   "pipeline_event": "UPDATED_FROM_TASK_RESULT"
+# }
 ```
+
+#### Evidence Pack Lifecycle
+
+1. **Request** (`POST /v1/evidence-packs`):
+   - Returns `HTTP 202 Accepted` with `status="pending"`
+   - Includes `task_id`, `task_status` (Celery state), `pipeline_event`, and `Retry-After` header
+   - Task is enqueued for async generation
+
+2. **Poll** (`GET /v1/evidence-packs/{certificate_id}`):
+   - Returns `HTTP 202 Accepted` if still pending (with `Retry-After` header)
+   - Returns `HTTP 200 OK` when ready (with `signed_urls` and `download_urls`)
+   - Returns `HTTP 503 Service Unavailable` for transient infrastructure failures (broker down, Celery unavailable)
+   - Use `Retry-After` header value for polling backoff
+
+3. **Task Fields**:
+   - `task_id`: Hash-based deterministic Celery task ID
+   - `task_status`: ONLY Celery states (`PENDING`, `STARTED`, `RETRY`, `SUCCESS`, `FAILURE`) or `None` if unknown
+   - `task_state`: Deprecated, always mirrors `task_status` for backward compatibility
+   - `pipeline_event`: Custom pipeline events (`ENQUEUED`, `POLLING`, `STUCK_REQUEUED`, `UPDATED_FROM_TASK_RESULT`) - separate from `task_status`
+   - `error_code`: Set for transient infra failures (broker down) or permanent failures (generation error)
+
+4. **State Machine**:
+   - `pending`: May have `error_code` set for transient failures (allows retry)
+   - `ready`: Artifacts exist, `signed_urls` available
+   - `failed`: Only for deterministic generation failures (task ran and errored), not broker connectivity
 
 ### Testing
 
-### Integration Tests
+#### SQLite (Unit Tests)
+
+Unit tests use SQLite in-memory database and don't require external services:
+
+```bash
+# Run unit tests only
+pytest apps/api/tests -v -m "not integration"
+```
+
+#### PostgreSQL (Integration Tests)
 
 Integration tests require a test database and Redis. Use the provided docker-compose setup:
 
 ```bash
-# Start test dependencies
+# Start test dependencies (PostgreSQL + Redis)
 docker-compose -f docker-compose.test.yml up -d
 
 # Set test database URL
@@ -120,14 +179,9 @@ pytest apps/api/tests -v -m integration
 pytest apps/api/tests -v
 ```
 
-### Unit Tests
-
-Unit tests use SQLite in-memory database and don't require external services:
-
-```bash
-# Run unit tests only
-pytest apps/api/tests -v -m "not integration"
-```
+**Note:** Tests automatically detect `TEST_DATABASE_URL`:
+- If `TEST_DATABASE_URL` starts with `sqlite://`, uses SQLite in-memory (fast unit tests)
+- If `TEST_DATABASE_URL` starts with `postgresql://`, uses PostgreSQL (integration tests)
 
 ### Running Migrations
 
