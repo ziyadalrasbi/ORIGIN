@@ -23,3 +23,7 @@ celery_app.conf.update(
     task_soft_time_limit=25 * 60,  # 25 minutes
 )
 
+# Import tasks to register them with Celery
+# This must be done after celery_app is created
+from origin_worker import tasks  # noqa: F401, E402
+

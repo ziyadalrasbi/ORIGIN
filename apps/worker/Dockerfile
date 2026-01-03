@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy application code
 COPY apps/worker/ /app/
+COPY apps/api/ /app/origin_api/  # Make origin_api available to worker
 COPY infra/ /app/infra/
 COPY ml/ /app/ml/
 

@@ -88,6 +88,15 @@ class UploadContext(BaseModel):
     account_created_at: Optional[datetime] = None
 
 
+class ReviewPlaybook(BaseModel):
+    """Review playbook with actionable guidance (F1)."""
+    
+    recommended_next_checks: List[str] = Field(default_factory=list)
+    evidence_to_request: List[str] = Field(default_factory=list)
+    suggested_sla: Optional[str] = None  # e.g., "60-minute review target"
+    routing_hints: Optional[Dict[str, Any]] = Field(default_factory=dict)  # e.g., {"priority": "high", "team": "content_moderation"}
+
+
 class DecisionSummary(BaseModel):
     """Decision summary with rationale and review requirements."""
 
@@ -99,6 +108,7 @@ class DecisionSummary(BaseModel):
     triggered_rules: List[str] = Field(default_factory=list)
     human_review_required: bool = False
     sla_guidance: Optional[str] = None  # e.g., "60-minute review target for REVIEW decisions"
+    review_playbook: Optional[ReviewPlaybook] = None  # F1 - Actionable review guidance
 
 
 class InterpretabilityCue(BaseModel):
@@ -110,6 +120,15 @@ class InterpretabilityCue(BaseModel):
     explanation_method: Literal["heuristic", "model_based"] = "heuristic"
 
 
+class SignalDefinition(BaseModel):
+    """Signal definition for clarity and auditability (E)."""
+    
+    key: str
+    description: str
+    scope: str  # "tenant" or "cross_tenant"
+    query_window: Optional[str] = None  # e.g., "90d", "all_time"
+
+
 class MLSignalsContext(BaseModel):
     """ML model signals and predictions."""
 
@@ -118,8 +137,14 @@ class MLSignalsContext(BaseModel):
     anomaly_score: Optional[float] = None
     synthetic_likelihood: Optional[float] = None
     identity_confidence: Optional[float] = None
-    prior_sightings_count: Optional[int] = None
-    prior_quarantine_count: Optional[int] = None
+    # Renamed for precision (E1)
+    pvid_prior_uploads_90d: Optional[int] = None  # Prior uploads with same PVID in last 90 days
+    pvid_prior_uploads_total: Optional[int] = None  # Total prior uploads with same PVID (all time)
+    content_ref_prior_uploads_total: Optional[int] = None  # Prior uploads with same content_ref (all time)
+    isrc_prior_uploads_total: Optional[int] = None  # Prior uploads with same ISRC if present (all time)
+    # Legacy fields for backward compatibility (deprecated)
+    prior_sightings_count: Optional[int] = None  # Deprecated: use pvid_prior_uploads_90d
+    prior_quarantine_count: Optional[int] = None  # Deprecated: use identity_and_history.prior_quarantine_count
     has_prior_quarantine: bool = False
     has_prior_reject: bool = False
     primary_label: Optional[str] = None
@@ -130,6 +155,9 @@ class MLSignalsContext(BaseModel):
     model_metadata: Dict[str, Any] = Field(
         default_factory=dict
     )  # {"risk_model_version": "...", "anomaly_model_version": "..."}
+    signal_definitions: List[SignalDefinition] = Field(
+        default_factory=list
+    )  # Signal definitions for clarity (E1)
 
 
 class RegulatoryProfile(BaseModel):

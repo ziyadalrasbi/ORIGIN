@@ -91,6 +91,7 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-development}
     volumes:
       - ./apps/worker:/app
+      - ./apps/api:/app/api  # Mount entire apps/api so origin_api package structure is preserved
       - ./infra:/app/infra
       - ./ml:/app/ml
     depends_on:

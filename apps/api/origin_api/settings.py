@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # ML
     mlflow_tracking_uri: str = "file:./ml/mlruns"
     ml_model_registry_path: str = "./ml/models"
+    
+    # Provenance (for auditability)
+    git_commit_sha: Optional[str] = None  # Set via GIT_COMMIT_SHA env var
+    feature_schema_version: str = "v1.0"  # Feature schema version
+    risk_model_version: Optional[str] = None  # Semantic version or timestamp
+    anomaly_model_version: Optional[str] = None  # Semantic version or timestamp
 
     # Logging
     log_level: str = "INFO"

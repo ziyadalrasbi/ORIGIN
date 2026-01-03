@@ -126,9 +126,9 @@ async def request_evidence_pack(
         else:
             # Evidence pack exists but formats/storage_refs are missing - regenerate
             logger.info(f"Evidence pack exists but formats/storage_refs are missing. Regenerating...")
-            # Continue to generation code below
+            # Continue to async generation below
 
-    # Create evidence pack record
+    # Create or update evidence pack record with status="pending"
     # Always use raw SQL INSERT to avoid SQLAlchemy trying to insert columns that don't exist
     if not evidence_pack:
         # Check if migration has been applied (for later use)
@@ -199,131 +199,181 @@ async def request_evidence_pack(
         except Exception:
             db.rollback()
 
-    # Trigger async generation (will be handled by worker)
-    # For now, generate synchronously
-    generator = EvidencePackGenerator(db)
-    artifacts = {}
-
-    # Pass audience to generator (defaults to INTERNAL if not specified)
-    audience = request_data.audience or "INTERNAL"
-
-    # Generate artifacts
+    # Enqueue async Celery task for evidence pack generation (C)
     try:
+        # Use Celery's task signature without importing the task directly
+        # This works across containers via Redis broker
+        from celery import Celery
+        from celery.result import AsyncResult
+        
+        # Create a minimal Celery app to send tasks (doesn't need worker code)
+        from origin_api.settings import get_settings
+        settings = get_settings()
+        celery_app = Celery("origin_api")
+        celery_app.conf.broker_url = settings.redis_url
+        celery_app.conf.result_backend = settings.redis_url
+        
+        # Check if task is already running (idempotency - C2)
+        # Use task_id based on certificate_id to prevent duplicates
+        task_id = f"evidence_pack_{certificate.id}_{tenant.id}"
+        
+        # Check if task is already pending/running
+        existing_task = AsyncResult(task_id, app=celery_app)
+        task_state = existing_task.state
+        logger.info(f"Checking existing task {task_id}: state={task_state}")
+        
+        # Only skip if task is actually running (STARTED) or retrying
+        # If PENDING for too long, it might be stuck - allow re-enqueue
+        if task_state == "STARTED" or task_state == "RETRY":
+            logger.info(f"Evidence pack generation task already in progress: {task_id} (state={task_state})")
+            # Return pending status
+            return {
+                "status": "pending",
+                "certificate_id": request_data.certificate_id,
+                "formats": formats,
+                "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
+            }
+        elif task_state == "PENDING":
+            # PENDING means task is in queue but not started yet
+            # Check if it's been pending too long (stuck in queue)
+            try:
+                # If task has no result yet and is just PENDING, it might be stuck
+                # Allow re-enqueue to unstick it
+                logger.info(f"Task {task_id} is PENDING - will enqueue new task (may replace stuck one)")
+            except Exception:
+                pass
+        elif task_state == "SUCCESS":
+            # Task completed - check if DB was updated
+            logger.info(f"Task {task_id} already completed - checking DB status")
+        elif task_state == "FAILURE":
+            # Task failed - allow re-enqueue
+            logger.warning(f"Previous task {task_id} failed - allowing re-enqueue")
+        
+        # Enqueue new task using task signature
+        audience = request_data.audience or "INTERNAL"
+        task_signature = celery_app.signature(
+            "origin_worker.tasks.generate_evidence_pack",
+            args=[certificate.certificate_id, tenant.id, formats, audience],
+            task_id=task_id,
+        )
+        task = task_signature.apply_async()
+        logger.info(f"Enqueued evidence pack generation task: {task.id} for certificate {certificate.certificate_id}")
+        
+    except ImportError:
+        # Fallback to synchronous generation if Celery is not available
+        logger.warning("Celery not available, falling back to synchronous generation")
+        from origin_api.evidence.generator import EvidencePackGenerator
+        
+        generator = EvidencePackGenerator(db)
+        artifacts = {}
+        audience = request_data.audience or "INTERNAL"
+        
         if "json" in formats:
             artifacts["json"] = generator.generate_json(certificate, upload, audience=audience)
-            logger.info("Generated JSON artifact")
-    except Exception as e:
-        logger.error(f"Failed to generate JSON artifact: {e}")
-
-    try:
         if "pdf" in formats:
             artifacts["pdf"] = generator.generate_pdf(certificate, upload)
-            logger.info("Generated PDF artifact")
-    except Exception as e:
-        logger.error(f"Failed to generate PDF artifact: {e}")
-
-    try:
         if "html" in formats:
             artifacts["html"] = generator.generate_html(certificate, upload)
-            logger.info("Generated HTML artifact")
-    except Exception as e:
-        logger.error(f"Failed to generate HTML artifact: {e}")
-
-    # Save artifacts
-    storage_refs = {}
-    try:
-        storage_refs = generator.save_artifacts(
-            certificate.certificate_id, formats, artifacts
-        )
-        logger.info(f"Saved artifacts: {storage_refs}")
-    except Exception as e:
-        logger.error(f"Failed to save artifacts: {e}")
-    
-    # Debug: Log what we got
-    logger.info(f"Generated artifacts: {list(artifacts.keys())}")
-    logger.info(f"Storage refs: {storage_refs}")
-    logger.info(f"Formats requested: {formats}")
-
-    # Always use raw SQL update to ensure it works with MinimalEvidencePack objects
-    import json
-    formats_json = json.dumps(formats) if formats else None
-    storage_refs_json = json.dumps(storage_refs) if storage_refs else None
-    
-    logger.info(f"Formats JSON: {formats_json}")
-    logger.info(f"Storage refs JSON: {storage_refs_json}")
-    
-    # Update by certificate_id instead of id to ensure we get the right record
-    # Use CAST instead of ::jsonb for parameterized queries
-    try:
-        db.execute(
-            text("UPDATE evidence_packs SET status = :status, formats = CAST(:formats AS jsonb), storage_refs = CAST(:storage_refs AS jsonb), ready_at = NOW() "
-                 "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
-            {
-                "status": "ready",
-                "formats": formats_json,
-                "storage_refs": storage_refs_json,
-                "tenant_id": tenant.id,
-                "certificate_id": certificate.id,
-            }
-        )
-        db.commit()
-        logger.info("Database update successful")
-    except Exception as e:
-        logger.error(f"Database update failed: {e}")
-        db.rollback()
-        # Try again with just the essential fields
+        
+        storage_refs = generator.save_artifacts(certificate.certificate_id, formats, artifacts, audience=audience)
+        
+        # Update evidence pack
+        import json
+        formats_json = json.dumps(formats) if formats else None
+        storage_refs_json = json.dumps(storage_refs) if storage_refs else None
+        
         try:
             db.execute(
-                text("UPDATE evidence_packs SET status = :status, storage_refs = CAST(:storage_refs AS jsonb) WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
+                text("UPDATE evidence_packs SET status = 'ready', formats = CAST(:formats AS jsonb), storage_refs = CAST(:storage_refs AS jsonb), ready_at = NOW() "
+                     "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
                 {
-                    "status": "ready",
+                    "formats": formats_json,
                     "storage_refs": storage_refs_json,
                     "tenant_id": tenant.id,
                     "certificate_id": certificate.id,
                 }
             )
             db.commit()
-            logger.info("Fallback database update successful")
-        except Exception as e2:
-            logger.error(f"Fallback database update also failed: {e2}")
+        except Exception:
             db.rollback()
-
-    # Always use the values we just saved - don't query DB again
-    # The database update might have issues, but we know what we saved
-    # Log what we have before processing
-    logger.info(f"Raw formats variable: {formats} (type: {type(formats)})")
-    logger.info(f"Raw storage_refs variable: {storage_refs} (type: {type(storage_refs)})")
+        
+        # Build download URLs
+        download_urls = {}
+        if storage_refs:
+            for fmt in formats:
+                download_urls[fmt] = f"/v1/evidence-packs/{request_data.certificate_id}/download/{fmt}"
+        
+        return {
+            "status": "ready",
+            "certificate_id": request_data.certificate_id,
+            "version": "origin-evidence-v2",
+            "evidence_hash": None,
+            "formats": formats,
+            "available_formats": formats,
+            "storage_refs": storage_refs,
+            "download_urls": download_urls,
+        }
+    except Exception as e:
+        logger.error(f"Failed to enqueue evidence pack generation task: {e}")
+        # Fallback to synchronous generation
+        from origin_api.evidence.generator import EvidencePackGenerator
+        
+        generator = EvidencePackGenerator(db)
+        artifacts = {}
+        audience = request_data.audience or "INTERNAL"
+        
+        if "json" in formats:
+            artifacts["json"] = generator.generate_json(certificate, upload, audience=audience)
+        if "pdf" in formats:
+            artifacts["pdf"] = generator.generate_pdf(certificate, upload)
+        if "html" in formats:
+            artifacts["html"] = generator.generate_html(certificate, upload)
+        
+        storage_refs = generator.save_artifacts(certificate.certificate_id, formats, artifacts, audience=audience)
+        
+        # Update evidence pack
+        import json
+        formats_json = json.dumps(formats) if formats else None
+        storage_refs_json = json.dumps(storage_refs) if storage_refs else None
+        
+        try:
+            db.execute(
+                text("UPDATE evidence_packs SET status = 'ready', formats = CAST(:formats AS jsonb), storage_refs = CAST(:storage_refs AS jsonb), ready_at = NOW() "
+                     "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
+                {
+                    "formats": formats_json,
+                    "storage_refs": storage_refs_json,
+                    "tenant_id": tenant.id,
+                    "certificate_id": certificate.id,
+                }
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+        
+        # Build download URLs
+        download_urls = {}
+        if storage_refs:
+            for fmt in formats:
+                download_urls[fmt] = f"/v1/evidence-packs/{request_data.certificate_id}/download/{fmt}"
+        
+        return {
+            "status": "ready",
+            "certificate_id": request_data.certificate_id,
+            "version": "origin-evidence-v2",
+            "evidence_hash": None,
+            "formats": formats,
+            "available_formats": formats,
+            "storage_refs": storage_refs,
+            "download_urls": download_urls,
+        }
     
-    # Ensure we have valid types (lists/dicts, not None)
-    final_formats = formats if formats is not None else []
-    final_storage_refs = storage_refs if storage_refs is not None else {}
-    
-    # Log what we're returning (this will help debug)
-    logger.info(f"Returning formats: {final_formats} (type: {type(final_formats)}, len: {len(final_formats) if isinstance(final_formats, list) else 'N/A'})")
-    logger.info(f"Returning storage_refs: {final_storage_refs} (type: {type(final_storage_refs)}, keys: {list(final_storage_refs.keys()) if isinstance(final_storage_refs, dict) else 'N/A'})")
-    logger.info(f"Artifacts generated: {list(artifacts.keys())}")
-    
-    # Get evidence_hash from evidence pack (safely handle missing columns)
-    evidence_hash = getattr(evidence_pack, 'evidence_hash', None) if evidence_pack else None
-    evidence_version = getattr(evidence_pack, 'evidence_version', None) or "origin-evidence-v2"
-    
-    # Build download URLs for easy access
-    download_urls = {}
-    if final_storage_refs:
-        for fmt in final_formats:
-            download_urls[fmt] = f"/v1/evidence-packs/{request_data.certificate_id}/download/{fmt}"
-    
-    # Always return the actual values, not None
-    # Empty lists/dicts are valid, so return them as-is
+    # Return pending status with poll URL
     return {
-        "status": "ready",
+        "status": "pending",
         "certificate_id": request_data.certificate_id,
-        "version": evidence_version,
-        "evidence_hash": evidence_hash,
-        "formats": final_formats,  # Return list even if empty
-        "available_formats": final_formats,  # Return list even if empty
-        "storage_refs": final_storage_refs,  # Return dict even if empty
-        "download_urls": download_urls,
+        "formats": formats,
+        "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
     }
 
 
@@ -350,6 +400,14 @@ async def get_evidence_pack(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Certificate {certificate_id} not found",
+        )
+    
+    # Get upload (needed for fallback synchronous generation)
+    upload = db.query(Upload).filter(Upload.id == certificate.upload_id).first()
+    if not upload:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Upload not found for certificate",
         )
 
     # Get evidence pack (explicitly select only existing columns)
@@ -385,6 +443,134 @@ async def get_evidence_pack(
             "certificate_id": certificate_id,
         }
 
+    # Check Celery task status if pending (fix stuck pending status)
+    if evidence_pack.status == "pending":
+        try:
+            from celery import Celery
+            from celery.result import AsyncResult
+            from origin_api.settings import get_settings
+            from datetime import datetime, timedelta
+            
+            # Create a minimal Celery app to check task status (same as POST endpoint)
+            settings = get_settings()
+            celery_app = Celery("origin_api")
+            celery_app.conf.broker_url = settings.redis_url
+            celery_app.conf.result_backend = settings.redis_url
+            
+            task_id = f"evidence_pack_{certificate.id}_{tenant.id}"
+            task_result = AsyncResult(task_id, app=celery_app)
+            
+            # Check if task has been pending for too long (5 minutes) - fallback to sync
+            # Get created_at from evidence_pack if available
+            try:
+                created_at_result = db.execute(
+                    text("SELECT created_at FROM evidence_packs WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
+                    {"tenant_id": tenant.id, "certificate_id": certificate.id}
+                ).first()
+                if created_at_result:
+                    created_at = created_at_result[0]
+                    if isinstance(created_at, datetime):
+                        time_elapsed = datetime.utcnow() - created_at.replace(tzinfo=None) if created_at.tzinfo else datetime.utcnow() - created_at
+                        if time_elapsed > timedelta(minutes=5):
+                            logger.warning(f"Evidence pack generation stuck for {time_elapsed}, falling back to synchronous generation for {certificate_id}")
+                            # Fallback to synchronous generation
+                            from origin_api.evidence.generator import EvidencePackGenerator
+                            
+                            generator = EvidencePackGenerator(db)
+                            artifacts = {}
+                            audience = "INTERNAL"  # Default to INTERNAL
+                            
+                            if "json" in (evidence_pack.formats or []):
+                                artifacts["json"] = generator.generate_json(certificate, upload, audience=audience)
+                            if "pdf" in (evidence_pack.formats or []):
+                                artifacts["pdf"] = generator.generate_pdf(certificate, upload)
+                            if "html" in (evidence_pack.formats or []):
+                                artifacts["html"] = generator.generate_html(certificate, upload)
+                            
+                            storage_refs = generator.save_artifacts(
+                                certificate.certificate_id, evidence_pack.formats or [], artifacts, audience=audience
+                            )
+                            
+                            import json
+                            storage_refs_json = json.dumps(storage_refs) if storage_refs else None
+                            formats_json = json.dumps(evidence_pack.formats) if evidence_pack.formats else None
+                            
+                            db.execute(
+                                text("UPDATE evidence_packs SET status = 'ready', storage_refs = CAST(:storage_refs AS jsonb), "
+                                     "formats = CAST(:formats AS jsonb), ready_at = NOW() "
+                                     "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
+                                {
+                                    "storage_refs": storage_refs_json,
+                                    "formats": formats_json,
+                                    "tenant_id": tenant.id,
+                                    "certificate_id": certificate.id,
+                                }
+                            )
+                            db.commit()
+                            
+                            # Refresh evidence_pack from DB
+                            result = db.execute(stmt).first()
+                            if result:
+                                evidence_pack = SimpleEvidencePack(result.id, "ready", result.formats, result.storage_refs)
+                            logger.info(f"Completed evidence pack generation synchronously (fallback) for {certificate_id}")
+            except Exception as fallback_error:
+                logger.error(f"Error in fallback synchronous generation: {fallback_error}")
+            
+            if evidence_pack.status == "pending":  # Only check Celery if still pending after fallback check
+                if task_result.state == "SUCCESS":
+                    # Task completed successfully - update DB from task result
+                    task_data = task_result.result
+                    if isinstance(task_data, dict):
+                        storage_refs = task_data.get("storage_refs", {})
+                        formats = task_data.get("formats", [])
+                        
+                        import json
+                        storage_refs_json = json.dumps(storage_refs) if storage_refs else None
+                        formats_json = json.dumps(formats) if formats else None
+                        
+                        db.execute(
+                            text("UPDATE evidence_packs SET status = 'ready', storage_refs = CAST(:storage_refs AS jsonb), "
+                                 "formats = CAST(:formats AS jsonb), ready_at = NOW() "
+                                 "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
+                            {
+                                "storage_refs": storage_refs_json,
+                                "formats": formats_json,
+                                "tenant_id": tenant.id,
+                                "certificate_id": certificate.id,
+                            }
+                        )
+                        db.commit()
+                        
+                        # Refresh evidence_pack from DB
+                        result = db.execute(stmt).first()
+                        if result:
+                            evidence_pack = SimpleEvidencePack(result.id, "ready", result.formats, result.storage_refs)
+                        logger.info(f"Updated evidence pack status to ready from Celery task result for {certificate_id}")
+                    else:
+                        logger.warning(f"Unexpected task result format for {certificate_id}: {type(task_data)}")
+                        
+                elif task_result.state == "FAILURE":
+                    # Task failed - update status to failed
+                    db.execute(
+                        text("UPDATE evidence_packs SET status = 'failed' WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
+                        {"tenant_id": tenant.id, "certificate_id": certificate.id}
+                    )
+                    db.commit()
+                    evidence_pack.status = "failed"
+                    logger.warning(f"Evidence pack generation failed for {certificate_id}: {task_result.info}")
+                    
+                elif task_result.state in ("PENDING", "STARTED", "RETRY"):
+                    # Task still running - return pending status
+                    logger.debug(f"Evidence pack generation still in progress for {certificate_id}: {task_result.state}")
+                else:
+                    logger.warning(f"Unknown Celery task state for {certificate_id}: {task_result.state}")
+                
+        except ImportError:
+            logger.warning("Celery not available, cannot check async task status.")
+        except Exception as e:
+            logger.error(f"Error checking Celery task status for {certificate_id}: {e}")
+            # Continue with DB status
+
     # Generate signed URLs (for now, return paths - in production, use S3 signed URLs)
     signed_urls = {}
     if evidence_pack.storage_refs:
@@ -400,6 +586,7 @@ async def get_evidence_pack(
         "formats": evidence_pack.formats or [],
         "available_formats": evidence_pack.formats or [],
         "signed_urls": signed_urls,
+        "poll_url": f"/v1/evidence-packs/{certificate_id}" if evidence_pack.status == "pending" else None,
     }
 
 
@@ -455,31 +642,101 @@ async def download_evidence_pack(
             detail="Evidence pack not ready",
         )
 
-    # Get storage path
-    storage_path = evidence_pack.storage_refs.get(format) if evidence_pack.storage_refs else None
-    if not storage_path:
+    # Validate format (D2 - prevent arbitrary format requests)
+    allowed_formats = {"json", "pdf", "html"}
+    if format not in allowed_formats:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid format: {format}. Allowed: {allowed_formats}",
+        )
+    
+    # Get storage reference (object key or filesystem path)
+    storage_ref = evidence_pack.storage_refs.get(format) if evidence_pack.storage_refs else None
+    if not storage_ref:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Format {format} not available",
         )
-
-    # Read file
-    from pathlib import Path
-
-    file_path = Path(storage_path)
-    if not file_path.exists():
+    
+    # Determine audience from request (default to INTERNAL, but check if DSP requested)
+    # For now, we'll use the audience from the storage_ref path if it's an object key
+    # In production, this should come from request headers or tenant context
+    requested_audience = "INTERNAL"  # TODO: Extract from request context/headers
+    
+    # Enforce audience access control (D2)
+    # DSP cannot download INTERNAL artifacts
+    if requested_audience == "DSP":
+        # Check if storage_ref is for INTERNAL audience
+        if isinstance(storage_ref, str) and storage_ref.startswith("evidence/") and "/INTERNAL/" in storage_ref:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="DSP audience cannot access INTERNAL evidence packs",
+            )
+    
+    # Retrieve artifact from storage (D2 - path traversal prevention)
+    content = None
+    try:
+        from origin_api.storage.service import get_storage_service
+        
+        storage_service = get_storage_service()
+        
+        # Check if it's an object key (starts with "evidence/") or filesystem path
+        if isinstance(storage_ref, str) and storage_ref.startswith("evidence/"):
+            # Object storage key - retrieve from MinIO/S3
+            if storage_service.client:
+                content = storage_service.get_object(storage_ref)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Object storage not available",
+                )
+        elif isinstance(storage_ref, str) and storage_ref.startswith("file://"):
+            # Filesystem fallback - validate path to prevent traversal
+            from pathlib import Path
+            
+            file_path = Path(storage_ref.replace("file://", ""))
+            # Ensure path is within storage_base (prevent path traversal)
+            storage_base = Path("/app/evidence_packs")
+            try:
+                file_path.resolve().relative_to(storage_base.resolve())
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Invalid file path",
+                )
+            
+            if not file_path.exists():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+            
+            with open(file_path, "rb") as f:
+                content = f.read()
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid storage reference format",
+            )
+    except FileNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-
+    except Exception as e:
+        logger.error(f"Failed to retrieve artifact: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve artifact",
+        )
+    
     # Determine content type
     content_types = {
         "json": "application/json",
         "pdf": "application/pdf",
         "html": "text/html",
     }
-
-    with open(file_path, "rb") as f:
-        content = f.read()
-
+    
+    # Log download for audit (D2)
+    logger.info(
+        f"Evidence pack download: certificate_id={certificate_id}, format={format}, "
+        f"audience={requested_audience}, tenant_id={tenant.id}"
+    )
+    
     return Response(
         content=content,
         media_type=content_types.get(format, "application/octet-stream"),

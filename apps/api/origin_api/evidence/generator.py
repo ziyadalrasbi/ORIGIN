@@ -13,11 +13,14 @@ Key principles:
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from jinja2 import Template
+
+logger = logging.getLogger(__name__)
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -41,7 +44,9 @@ from origin_api.evidence.schema import (
     CertificateContext,
     UploadContext,
     DecisionSummary,
+    ReviewPlaybook,
     MLSignalsContext,
+    SignalDefinition,
     InterpretabilityCue,
     RegulatoryProfile,
     RiskImpactAnalysis,
@@ -513,6 +518,21 @@ class EvidencePackGenerator:
         risk_score_from_trace = decision_trace.get("risk_score")
         assurance_score_from_trace = decision_trace.get("assurance_score")
         
+        # ML Signals Context - use ledger values as source of truth
+        # Extract risk_score and assurance_score BEFORE they're used in _build_review_playbook
+        risk_score = float(risk_score_from_trace) if risk_score_from_trace is not None else (float(upload.risk_score) if upload.risk_score else 0.0)
+        assurance_score = float(assurance_score_from_trace) if assurance_score_from_trace is not None else (float(upload.assurance_score) if upload.assurance_score else 0.0)
+        
+        # Build Review Playbook from signals and policy (F1)
+        review_playbook = self._build_review_playbook(
+            decision_from_trace,
+            risk_score,
+            ml_signals,
+            policy_profile,
+            decision_trace.get("triggered_rules", []),
+            decision_trace.get("reason_codes", []),
+        )
+        
         decision_summary = DecisionSummary(
             decision=decision_from_trace,
             decision_mode=decision_mode,
@@ -522,11 +542,8 @@ class EvidencePackGenerator:
             triggered_rules=decision_trace.get("triggered_rules", []),
             human_review_required=human_review_required,
             sla_guidance=sla_guidance,
+            review_playbook=review_playbook,  # F1
         )
-
-        # ML Signals Context - use ledger values as source of truth
-        risk_score = float(risk_score_from_trace) if risk_score_from_trace is not None else (float(upload.risk_score) if upload.risk_score else 0.0)
-        assurance_score = float(assurance_score_from_trace) if assurance_score_from_trace is not None else (float(upload.assurance_score) if upload.assurance_score else 0.0)
 
         # Build interpretability cues (heuristic-based, not ML-derived)
         # These are honest heuristics, not true model explainability.
@@ -722,12 +739,23 @@ class EvidencePackGenerator:
                 "timestamp": ledger_event.created_at.isoformat() if ledger_event.created_at else None,
             }
 
+        # Extract provenance from ledger outputs (B)
+        model_provenance = {}
+        policy_profile_id = None
+        if ledger_event and ledger_event.payload_json:
+            outputs = ledger_event.payload_json.get("outputs", {})
+            model_provenance = outputs.get("model_provenance", {})
+            policy_profile_id = outputs.get("policy_profile_id")
+        
         certificate_data = {
             "inputs_hash": certificate.inputs_hash,
             "outputs_hash": certificate.outputs_hash,
             "signature": certificate.signature,
             "algorithm": "RSA-PSS-SHA256",
             "key_fingerprint": None,
+            # Include model/policy provenance for auditability (B)
+            "model_provenance": model_provenance,
+            "policy_profile_id": policy_profile_id,
         }
 
         verification_guidance = (
@@ -821,6 +849,111 @@ class EvidencePackGenerator:
 
         return false_positive_risk, false_negative_risk, expected_harm
 
+    def _build_review_playbook(
+        self,
+        decision: str,
+        risk_score: float,
+        ml_signals: dict,
+        policy_profile: Optional[PolicyProfile],
+        triggered_rules: list[str],
+        reason_codes: list[str],
+    ) -> ReviewPlaybook:
+        """
+        Build review playbook from signals and policy (F1).
+        
+        Generates actionable guidance based on:
+        - Decision type and risk level
+        - Triggered rules and reason codes
+        - ML signals (anomaly, synthetic, identity confidence)
+        - Policy thresholds
+        
+        Returns deterministic, signal-driven recommendations.
+        """
+        recommended_checks = []
+        evidence_to_request = []
+        suggested_sla = None
+        routing_hints = {}
+        
+        # Decision-specific guidance
+        if decision == "REVIEW":
+            suggested_sla = "60-minute review target"
+            routing_hints["priority"] = "medium"
+            routing_hints["team"] = "content_moderation"
+            
+            # Check for specific risk drivers
+            if "RISK_SCORE_MODERATE" in reason_codes:
+                recommended_checks.append("Verify content authenticity and metadata accuracy")
+                recommended_checks.append("Check for duplicate content across platform")
+                evidence_to_request.append("Original content file for manual inspection")
+                evidence_to_request.append("Creator identity verification documents")
+            
+            if ml_signals.get("anomaly_score", 100) < 40:
+                recommended_checks.append("Investigate anomalous behavior patterns")
+                recommended_checks.append("Review account activity history")
+                evidence_to_request.append("Account activity logs (last 30 days)")
+            
+            if ml_signals.get("synthetic_likelihood", 0) > 50:
+                recommended_checks.append("Verify content is not AI-generated without disclosure")
+                recommended_checks.append("Check for AI generation tool signatures")
+                evidence_to_request.append("Content generation metadata")
+                routing_hints["priority"] = "high"
+                routing_hints["team"] = "ai_compliance"
+        
+        elif decision == "QUARANTINE":
+            suggested_sla = "30-minute review target"
+            routing_hints["priority"] = "high"
+            routing_hints["team"] = "risk_management"
+            
+            recommended_checks.append("Immediate content isolation and review")
+            recommended_checks.append("Verify creator identity and account status")
+            recommended_checks.append("Check for cross-tenant identity reuse")
+            evidence_to_request.append("Full account history and prior decisions")
+            evidence_to_request.append("Cross-tenant identity graph signals (if available)")
+            
+            if ml_signals.get("has_prior_quarantine", False):
+                recommended_checks.append("Review prior quarantine reasons and resolution")
+                routing_hints["escalation"] = "required"
+        
+        elif decision == "REJECT":
+            suggested_sla = "Immediate action required"
+            routing_hints["priority"] = "critical"
+            routing_hints["team"] = "risk_management"
+            
+            recommended_checks.append("Content removal and account suspension review")
+            recommended_checks.append("Full audit of creator's upload history")
+            recommended_checks.append("Legal/compliance review if applicable")
+            evidence_to_request.append("Complete account audit trail")
+            evidence_to_request.append("All prior decisions and appeals")
+            
+            if ml_signals.get("has_prior_reject", False):
+                recommended_checks.append("Permanent account termination review")
+                routing_hints["escalation"] = "executive_review"
+        
+        elif decision == "ALLOW":
+            suggested_sla = None  # No review needed
+            routing_hints["priority"] = "low"
+            # Still provide guidance for edge cases
+            if risk_score > 20:
+                recommended_checks.append("Monitor for similar patterns in future uploads")
+        
+        # Add policy-specific checks if thresholds were close
+        if policy_profile and policy_profile.thresholds_json:
+            thresholds = policy_profile.thresholds_json
+            review_threshold = thresholds.get("risk_threshold_review", 40)
+            quarantine_threshold = thresholds.get("risk_threshold_quarantine", 70)
+            
+            if abs(risk_score - review_threshold) < 5:
+                recommended_checks.append("Risk score near review threshold - verify threshold calibration")
+            if abs(risk_score - quarantine_threshold) < 5:
+                recommended_checks.append("Risk score near quarantine threshold - verify threshold calibration")
+        
+        return ReviewPlaybook(
+            recommended_next_checks=recommended_checks,
+            evidence_to_request=evidence_to_request,
+            suggested_sla=suggested_sla,
+            routing_hints=routing_hints,
+        )
+    
     def _compute_historical_consistency(self, upload: Upload) -> Optional[dict]:
         """Compute historical consistency for account/PVID."""
         if not upload.account_id and not upload.pvid:
@@ -1014,10 +1147,31 @@ class EvidencePackGenerator:
         
         # Add EvidencePackV2 enhancements if available
         if evidence_v2:
-            # Decision Summary with rationale
+            # Decision Summary with structured rationale (A3)
             if evidence_v2.decision_summary.decision_rationale:
                 story.append(Paragraph("<b>Decision Rationale</b>", heading_style))
-                story.append(Paragraph(evidence_v2.decision_summary.decision_rationale, styles["Normal"]))
+                rationale = evidence_v2.decision_summary.decision_rationale
+                
+                # Parse structured rationale format
+                parts = rationale.split(". ")
+                for part in parts:
+                    if part.strip():
+                        if part.startswith("Decision:"):
+                            story.append(Paragraph(f"<b>Decision:</b> {part.replace('Decision:', '').strip()}", styles["Normal"]))
+                        elif part.startswith("Thresholds:"):
+                            thresholds_text = part.replace("Thresholds:", "").strip()
+                            story.append(Paragraph(f"<b>Thresholds Used:</b> {thresholds_text}", styles["Normal"]))
+                        elif part.startswith("Primary drivers:"):
+                            drivers_text = part.replace("Primary drivers:", "").strip()
+                            story.append(Paragraph(f"<b>Primary Drivers:</b> {drivers_text}", styles["Normal"]))
+                        elif part.startswith("Counterfactual:"):
+                            counterfactual_text = part.replace("Counterfactual:", "").strip()
+                            story.append(Paragraph(f"<b>Counterfactual Analysis:</b> {counterfactual_text}", styles["Normal"]))
+                        elif part.startswith("Note:"):
+                            note_text = part.replace("Note:", "").strip()
+                            story.append(Paragraph(f"<i>Note:</i> {note_text}", styles["Normal"]))
+                        else:
+                            story.append(Paragraph(part.strip(), styles["Normal"]))
                 story.append(Spacer(1, 0.2 * inch))
             
             # Regulatory Profile (if applicable regimes present)
@@ -1196,10 +1350,76 @@ class EvidencePackGenerator:
         story.append(scores_table)
         story.append(Spacer(1, 0.2 * inch))
 
-        # Decision Rationale
+        # Decision Rationale - Parse structured format (A3)
         if data["decision_trace"].get("rationale"):
             story.append(Paragraph("<b>Decision Rationale</b>", heading_style))
-            story.append(Paragraph(data["decision_trace"]["rationale"], styles["Normal"]))
+            rationale = data["decision_trace"]["rationale"]
+            
+            # Parse structured rationale format: "Decision: ... Thresholds: ... Primary drivers: ... Counterfactual: ..."
+            parts = rationale.split(". ")
+            for part in parts:
+                if part.strip():
+                    # Format each part nicely
+                    if part.startswith("Decision:"):
+                        story.append(Paragraph(f"<b>Decision:</b> {part.replace('Decision:', '').strip()}", styles["Normal"]))
+                    elif part.startswith("Thresholds:"):
+                        thresholds_text = part.replace("Thresholds:", "").strip()
+                        story.append(Paragraph(f"<b>Thresholds Used:</b> {thresholds_text}", styles["Normal"]))
+                    elif part.startswith("Primary drivers:"):
+                        drivers_text = part.replace("Primary drivers:", "").strip()
+                        story.append(Paragraph(f"<b>Primary Drivers:</b> {drivers_text}", styles["Normal"]))
+                    elif part.startswith("Counterfactual:"):
+                        counterfactual_text = part.replace("Counterfactual:", "").strip()
+                        story.append(Paragraph(f"<b>Counterfactual Analysis:</b> {counterfactual_text}", styles["Normal"]))
+                    elif part.startswith("Note:"):
+                        note_text = part.replace("Note:", "").strip()
+                        story.append(Paragraph(f"<i>Note:</i> {note_text}", styles["Normal"]))
+                    else:
+                        # Fallback: display as-is
+                        story.append(Paragraph(part.strip(), styles["Normal"]))
+            story.append(Spacer(1, 0.2 * inch))
+        
+        # Signal Definitions (E1) - Add after ML predictions
+        if evidence_v2 and evidence_v2.ml_and_signals.signal_definitions:
+            story.append(PageBreak())
+            story.append(Paragraph("<b>Signals & Definitions</b>", heading_style))
+            story.append(Paragraph(
+                "The following signals are used in decision-making. Each signal has a defined scope "
+                "(tenant-specific or cross-tenant) and query window for auditability.",
+                styles["Normal"]
+            ))
+            story.append(Spacer(1, 0.1 * inch))
+            
+            sig_def_data = [
+                [Paragraph("<b>Signal Key</b>", cell_style), Paragraph("<b>Description</b>", cell_style), 
+                 Paragraph("<b>Scope</b>", cell_style), Paragraph("<b>Query Window</b>", cell_style)]
+            ]
+            for sig_def in evidence_v2.ml_and_signals.signal_definitions:
+                sig_def_data.append([
+                    Paragraph(sig_def.key, cell_style),
+                    Paragraph(sig_def.description, cell_style),
+                    Paragraph(sig_def.scope, cell_style),
+                    Paragraph(sig_def.query_window or "N/A", cell_style),
+                ])
+            
+            sig_def_table = Table(sig_def_data, colWidths=[1.5 * inch, 3 * inch, 1 * inch, 1.2 * inch])
+            sig_def_table.setStyle(
+                TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 10),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dee2e6")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fa")]),
+                ])
+            )
+            story.append(sig_def_table)
             story.append(Spacer(1, 0.2 * inch))
 
         # Triggered Rules and Reason Codes
@@ -1260,6 +1480,37 @@ class EvidencePackGenerator:
                 story.append(ml_table)
             story.append(Spacer(1, 0.2 * inch))
 
+        # Review Playbook (F1) - Add after decision rationale
+        if evidence_v2 and evidence_v2.decision_summary.review_playbook:
+            playbook = evidence_v2.decision_summary.review_playbook
+            story.append(Paragraph("<b>Review Playbook</b>", heading_style))
+            story.append(Paragraph(
+                "Actionable guidance for human reviewers based on decision signals and policy.",
+                styles["Normal"]
+            ))
+            story.append(Spacer(1, 0.1 * inch))
+            
+            if playbook.recommended_next_checks:
+                story.append(Paragraph("<b>Recommended Next Checks:</b>", styles["Normal"]))
+                for check in playbook.recommended_next_checks:
+                    story.append(Paragraph(f"• {check}", styles["Normal"]))
+                story.append(Spacer(1, 0.1 * inch))
+            
+            if playbook.evidence_to_request:
+                story.append(Paragraph("<b>Evidence to Request:</b>", styles["Normal"]))
+                for evidence in playbook.evidence_to_request:
+                    story.append(Paragraph(f"• {evidence}", styles["Normal"]))
+                story.append(Spacer(1, 0.1 * inch))
+            
+            if playbook.suggested_sla:
+                story.append(Paragraph(f"<b>Suggested SLA:</b> {playbook.suggested_sla}", styles["Normal"]))
+                story.append(Spacer(1, 0.1 * inch))
+            
+            if playbook.routing_hints:
+                routing_text = ", ".join(f"{k}: {v}" for k, v in playbook.routing_hints.items())
+                story.append(Paragraph(f"<b>Routing Hints:</b> {routing_text}", styles["Normal"]))
+            story.append(Spacer(1, 0.2 * inch))
+        
         # Policy Thresholds - Use Paragraph objects for text wrapping
         if data["policy_profile"] and data["policy_profile"].thresholds_json:
             story.append(Paragraph("<b>Policy Thresholds</b>", heading_style))
@@ -1757,7 +2008,24 @@ class EvidencePackGenerator:
             <div class="section">
                 <h2 class="section-title">Decision Rationale</h2>
                 <div class="card">
-                    <p>{{ rationale }}</p>
+                    {% set parts = rationale.split('. ') %}
+                    {% for part in parts %}
+                        {% if part.strip() %}
+                            {% if part.startswith('Decision:') %}
+                                <p><strong>Decision:</strong> {{ part.replace('Decision:', '').strip() }}</p>
+                            {% elif part.startswith('Thresholds:') %}
+                                <p><strong>Thresholds Used:</strong> {{ part.replace('Thresholds:', '').strip() }}</p>
+                            {% elif part.startswith('Primary drivers:') %}
+                                <p><strong>Primary Drivers:</strong> {{ part.replace('Primary drivers:', '').strip() }}</p>
+                            {% elif part.startswith('Counterfactual:') %}
+                                <p><strong>Counterfactual Analysis:</strong> {{ part.replace('Counterfactual:', '').strip() }}</p>
+                            {% elif part.startswith('Note:') %}
+                                <p><em>Note:</em> {{ part.replace('Note:', '').strip() }}</p>
+                            {% else %}
+                                <p>{{ part.strip() }}</p>
+                            {% endif %}
+                        {% endif %}
+                    {% endfor %}
                 </div>
             </div>
             {% endif %}
@@ -1814,6 +2082,53 @@ class EvidencePackGenerator:
             </div>
             {% endif %}
             
+            {% if review_playbook %}
+            <!-- Review Playbook (F1) -->
+            <div class="section">
+                <h2 class="section-title">Review Playbook</h2>
+                <div class="card">
+                    <p style="margin-bottom: 15px; color: #6c757d;">
+                        Actionable guidance for human reviewers based on decision signals and policy.
+                    </p>
+                    {% if review_playbook.recommended_next_checks %}
+                    <div style="margin-bottom: 20px;">
+                        <h3 style="margin-bottom: 10px; color: #2c3e50;">Recommended Next Checks</h3>
+                        <ul style="list-style-type: disc; padding-left: 20px;">
+                            {% for check in review_playbook.recommended_next_checks %}
+                            <li style="margin-bottom: 5px;">{{ check }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    {% if review_playbook.evidence_to_request %}
+                    <div style="margin-bottom: 20px;">
+                        <h3 style="margin-bottom: 10px; color: #2c3e50;">Evidence to Request</h3>
+                        <ul style="list-style-type: disc; padding-left: 20px;">
+                            {% for evidence in review_playbook.evidence_to_request %}
+                            <li style="margin-bottom: 5px;">{{ evidence }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    {% if review_playbook.suggested_sla %}
+                    <div style="margin-bottom: 15px;">
+                        <strong>Suggested SLA:</strong> {{ review_playbook.suggested_sla }}
+                    </div>
+                    {% endif %}
+                    {% if review_playbook.routing_hints %}
+                    <div>
+                        <strong>Routing Hints:</strong>
+                        <ul style="list-style-type: none; padding-left: 0;">
+                            {% for key, value in review_playbook.routing_hints.items() %}
+                            <li style="margin-bottom: 5px;"><strong>{{ key }}:</strong> {{ value }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endif %}
+            
             {% if thresholds %}
             <!-- Policy Thresholds -->
             <div class="section">
@@ -1864,6 +2179,23 @@ class EvidencePackGenerator:
 </html>
         """
 
+        # Get EvidencePackV2 for signal definitions and review playbook (E1, F1)
+        evidence_v2 = None
+        try:
+            evidence_json = self.generate_json(certificate, upload, audience="INTERNAL")
+            evidence_v2 = EvidencePackV2.model_validate(evidence_json)
+        except Exception:
+            pass  # Fallback if v2 parsing fails
+        
+        # Extract signal definitions and review playbook safely
+        signal_definitions = []
+        review_playbook = None
+        if evidence_v2:
+            if evidence_v2.ml_and_signals.signal_definitions:
+                signal_definitions = [sd.model_dump() for sd in evidence_v2.ml_and_signals.signal_definitions]
+            if evidence_v2.decision_summary.review_playbook:
+                review_playbook = evidence_v2.decision_summary.review_playbook.model_dump()
+
         # Prepare threshold descriptions
         threshold_descriptions = {
             "risk_threshold_review": "Risk score above which content requires review",
@@ -1907,34 +2239,85 @@ class EvidencePackGenerator:
             inputs_hash=certificate.inputs_hash,
             outputs_hash=certificate.outputs_hash,
             signature=certificate.signature,
+            signal_definitions=signal_definitions,
+            review_playbook=review_playbook,
         )
 
     def save_artifacts(
-        self, certificate_id: str, formats: list[str], artifacts: dict
+        self, certificate_id: str, formats: list[str], artifacts: dict, audience: str = "INTERNAL"
     ) -> dict:
-        """Save artifacts to storage and return storage references."""
+        """
+        Save artifacts to object storage and return object keys (D1).
+        
+        Uses MinIO/S3 for secure storage. Returns object keys instead of filesystem paths
+        to prevent path traversal attacks.
+        
+        Args:
+            certificate_id: Certificate UUID
+            formats: List of formats to save
+            artifacts: Dict of format -> artifact data
+            audience: Audience for storage path (INTERNAL, DSP, REGULATOR)
+        
+        Returns:
+            Dict of format -> object_key (e.g., "evidence/{certificate_id}/{audience}/{format}")
+        """
+        from origin_api.storage.service import get_storage_service
+        
+        storage_service = get_storage_service()
         storage_refs = {}
-        cert_dir = self.storage_base / certificate_id
-        cert_dir.mkdir(parents=True, exist_ok=True)
-
+        
+        # Try object storage first, fallback to filesystem if unavailable
+        use_object_storage = storage_service.client is not None
+        
         for fmt in formats:
-            if fmt == "json" and "json" in artifacts:
-                path = cert_dir / "evidence.json"
-                with open(path, "w") as f:
-                    json.dump(artifacts["json"], f, indent=2)
-                storage_refs["json"] = str(path)
-
-            elif fmt == "pdf" and "pdf" in artifacts:
-                path = cert_dir / "evidence.pdf"
-                with open(path, "wb") as f:
-                    f.write(artifacts["pdf"])
-                storage_refs["pdf"] = str(path)
-
-            elif fmt == "html" and "html" in artifacts:
-                path = cert_dir / "evidence.html"
-                with open(path, "w") as f:
-                    f.write(artifacts["html"])
-                storage_refs["html"] = str(path)
-
+            try:
+                if fmt == "json" and "json" in artifacts:
+                    json_data = json.dumps(artifacts["json"], indent=2).encode("utf-8")
+                    if use_object_storage:
+                        object_key = storage_service.build_object_key(certificate_id, audience, "json")
+                        storage_service.put_object(object_key, json_data, content_type="application/json")
+                        storage_refs["json"] = object_key
+                    else:
+                        # Fallback to filesystem
+                        cert_dir = self.storage_base / certificate_id
+                        cert_dir.mkdir(parents=True, exist_ok=True)
+                        path = cert_dir / "evidence.json"
+                        with open(path, "wb") as f:
+                            f.write(json_data)
+                        storage_refs["json"] = f"file://{path}"  # Mark as filesystem path
+                
+                elif fmt == "pdf" and "pdf" in artifacts:
+                    pdf_data = artifacts["pdf"]
+                    if use_object_storage:
+                        object_key = storage_service.build_object_key(certificate_id, audience, "pdf")
+                        storage_service.put_object(object_key, pdf_data, content_type="application/pdf")
+                        storage_refs["pdf"] = object_key
+                    else:
+                        # Fallback to filesystem
+                        cert_dir = self.storage_base / certificate_id
+                        cert_dir.mkdir(parents=True, exist_ok=True)
+                        path = cert_dir / "evidence.pdf"
+                        with open(path, "wb") as f:
+                            f.write(pdf_data)
+                        storage_refs["pdf"] = f"file://{path}"  # Mark as filesystem path
+                
+                elif fmt == "html" and "html" in artifacts:
+                    html_data = artifacts["html"].encode("utf-8")
+                    if use_object_storage:
+                        object_key = storage_service.build_object_key(certificate_id, audience, "html")
+                        storage_service.put_object(object_key, html_data, content_type="text/html")
+                        storage_refs["html"] = object_key
+                    else:
+                        # Fallback to filesystem
+                        cert_dir = self.storage_base / certificate_id
+                        cert_dir.mkdir(parents=True, exist_ok=True)
+                        path = cert_dir / "evidence.html"
+                        with open(path, "wb") as f:
+                            f.write(html_data)
+                        storage_refs["html"] = f"file://{path}"  # Mark as filesystem path
+            except Exception as e:
+                logger.error(f"Failed to save {fmt} artifact: {e}")
+                # Continue with other formats
+        
         return storage_refs
 

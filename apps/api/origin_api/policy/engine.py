@@ -1,10 +1,12 @@
 """Policy engine for deterministic decision making."""
 
 import logging
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from origin_api.models import PolicyProfile
+from origin_api.policy.decision_mode import DecisionMode
 
 logger = logging.getLogger(__name__)
 
@@ -141,11 +143,19 @@ class PolicyEngine:
             return payload
         policy = self.get_policy_profile(tenant_id)
         thresholds = policy.thresholds_json or {}
-        decision_mode = getattr(policy, "decision_mode", None) or "score_first"
+        decision_mode_str = getattr(policy, "decision_mode", None) or "score_first"
+        
+        # Normalize decision mode to enum
+        try:
+            decision_mode = DecisionMode(decision_mode_str)
+        except ValueError:
+            decision_mode = DecisionMode.SCORE_FIRST
+            logger.warning(f"Unknown decision_mode '{decision_mode_str}', defaulting to SCORE_FIRST")
 
         triggered_rules: list[str] = []
         reason_codes: list[str] = []
-        rationale_parts: list[str] = []
+        decision_drivers: list[str] = []  # Top contributors to decision
+        counterfactual: Optional[str] = None
 
         # Thresholds
         risk_threshold_reject = thresholds.get("risk_threshold_reject", 90)
@@ -156,116 +166,161 @@ class PolicyEngine:
         assurance_threshold_allow = thresholds.get("assurance_threshold_allow", 80)
 
         # Baseline decision
-        if decision_mode == "label_first" and primary_label:
+        baseline_decision: Optional[str] = None
+        
+        if decision_mode == DecisionMode.LABEL_FIRST and primary_label:
+            baseline_decision = primary_label
             decision = primary_label
             triggered_rules.append("MODEL_PRIMARY_LABEL")
             reason_codes.append(f"MODEL_PRIMARY_LABEL_{primary_label}")
-            rationale_parts.append(
-                f"Model primary label {primary_label} with risk_score={risk_score:.1f}, assurance_score={assurance_score:.1f}"
-            )
+            decision_drivers.append(f"Model primary label: {primary_label} (probability: {class_probabilities.get(primary_label, 0):.1%})")
         else:
-            # score_first baseline using risk bands
-            rationale_parts.append("score_first baseline using risk thresholds")
+            # Score-first baseline using risk bands
             if risk_score >= risk_threshold_reject:
+                baseline_decision = "REJECT"
                 decision = "REJECT"
                 triggered_rules.append("RISK_THRESHOLD_REJECT")
                 reason_codes.append("RISK_SCORE_HIGH")
-                rationale_parts.append(
-                    f"Risk score {risk_score:.1f} exceeds reject threshold {risk_threshold_reject}"
-                )
+                decision_drivers.append(f"Risk score {risk_score:.1f} ≥ reject threshold {risk_threshold_reject}")
+                # Counterfactual: what would flip to QUARANTINE?
+                score_diff = risk_score - risk_threshold_reject
+                counterfactual = f"If risk score were {score_diff:.1f} points lower (from {risk_score:.1f} to {risk_threshold_reject:.1f}), decision would be QUARANTINE under current thresholds"
             elif risk_score >= risk_threshold_quarantine:
+                baseline_decision = "QUARANTINE"
                 decision = "QUARANTINE"
                 triggered_rules.append("RISK_THRESHOLD_QUARANTINE")
                 reason_codes.append("RISK_SCORE_HIGH")
-                rationale_parts.append(
-                    f"Risk score {risk_score:.1f} exceeds quarantine threshold {risk_threshold_quarantine}"
-                )
+                decision_drivers.append(f"Risk score {risk_score:.1f} ≥ quarantine threshold {risk_threshold_quarantine}")
+                # Counterfactual: what would flip to REVIEW?
+                score_diff = risk_score - risk_threshold_quarantine
+                counterfactual = f"If risk score were {score_diff:.1f} points lower (from {risk_score:.1f} to {risk_threshold_quarantine:.1f}), decision would be REVIEW under current thresholds"
             elif risk_score >= risk_threshold_review:
+                baseline_decision = "REVIEW"
                 decision = "REVIEW"
                 triggered_rules.append("RISK_THRESHOLD_REVIEW")
                 reason_codes.append("RISK_SCORE_MODERATE")
-                rationale_parts.append(
-                    f"Moderate risk between review {risk_threshold_review} and quarantine {risk_threshold_quarantine}"
-                )
+                decision_drivers.append(f"Risk score {risk_score:.1f} is between review threshold {risk_threshold_review} and quarantine threshold {risk_threshold_quarantine}")
+                # Counterfactual: what would flip to ALLOW?
+                score_diff = risk_threshold_review - risk_score
+                if score_diff > 0:
+                    counterfactual = f"If risk score were {score_diff:.1f} points lower (from {risk_score:.1f} to {risk_threshold_review - 0.1:.1f}), decision would be ALLOW under current thresholds"
+                else:
+                    counterfactual = f"If risk score were {risk_threshold_quarantine - risk_score:.1f} points higher (from {risk_score:.1f} to {risk_threshold_quarantine:.1f}), decision would be QUARANTINE under current thresholds"
             else:
-                # Low risk band allow if signals are clean
+                # Low risk band - check if signals are clean enough for ALLOW
                 if (
                     anomaly_score >= anomaly_threshold
                     and synthetic_likelihood < synthetic_threshold
                     and identity_confidence >= 40
                     and prior_sightings_count >= 1
                 ):
+                    baseline_decision = "ALLOW"
                     decision = "ALLOW"
                     triggered_rules.append("LOW_RISK_PROFILE")
                     reason_codes.append("LOW_RISK_NO_SIGNALS")
-                    rationale_parts.append(
-                        f"Low risk profile: risk={risk_score:.1f} < review {risk_threshold_review}, clean anomaly/synthetic, identity_confidence={identity_confidence:.1f}, prior_sightings={prior_sightings_count}"
-                    )
+                    decision_drivers.append(f"Risk score {risk_score:.1f} < review threshold {risk_threshold_review}")
+                    decision_drivers.append(f"Clean signals: anomaly_score={anomaly_score:.1f} (≥{anomaly_threshold}), synthetic_likelihood={synthetic_likelihood:.1f} (<{synthetic_threshold})")
+                    decision_drivers.append(f"Established identity: confidence={identity_confidence:.1f}%, prior_sightings={prior_sightings_count}")
+                    # Counterfactual: what would flip to REVIEW?
+                    counterfactual = f"If risk score were {risk_threshold_review - risk_score:.1f} points higher (from {risk_score:.1f} to {risk_threshold_review:.1f}), decision would be REVIEW under current thresholds"
                 else:
+                    baseline_decision = "REVIEW"
                     decision = "REVIEW"
                     triggered_rules.append("DEFAULT_REVIEW_BASELINE")
                     reason_codes.append("REQUIRES_MANUAL_REVIEW")
-                    rationale_parts.append("Low risk but missing clean-signal criteria, defaulting to REVIEW baseline")
+                    missing_criteria = []
+                    if anomaly_score < anomaly_threshold:
+                        missing_criteria.append(f"anomaly_score {anomaly_score:.1f} < threshold {anomaly_threshold}")
+                    if synthetic_likelihood >= synthetic_threshold:
+                        missing_criteria.append(f"synthetic_likelihood {synthetic_likelihood:.1f} ≥ threshold {synthetic_threshold}")
+                    if identity_confidence < 40:
+                        missing_criteria.append(f"identity_confidence {identity_confidence:.1f}% < 40%")
+                    if prior_sightings_count < 1:
+                        missing_criteria.append(f"prior_sightings {prior_sightings_count} < 1")
+                    decision_drivers.append(f"Low risk ({risk_score:.1f} < {risk_threshold_review}) but missing clean-signal criteria: {', '.join(missing_criteria)}")
+                    counterfactual = f"If signals were cleaner (anomaly_score≥{anomaly_threshold}, synthetic<{synthetic_threshold}, identity≥40%, prior_sightings≥1), decision would be ALLOW under current thresholds"
 
         # Guardrails (apply to both modes)
-        guardrail_notes: list[str] = []
+        guardrail_applied = False
+        original_decision = decision
 
         # Prior rejects/quarantines
         if has_prior_reject:
             if decision != "REJECT":
-                guardrail_notes.append("Escalated due to prior reject history")
+                guardrail_applied = True
+                decision_drivers.insert(0, f"GUARDRAIL: Prior reject history (escalated {original_decision} → REJECT)")
             decision = "REJECT"
             triggered_rules.append("GUARDRAIL_PRIOR_REJECT")
             reason_codes.append("PRIOR_REJECT_HISTORY")
 
         if has_prior_quarantine and decision in ("ALLOW", "REVIEW"):
+            guardrail_applied = True
+            decision_drivers.insert(0, f"GUARDRAIL: Prior quarantine history (escalated {decision} → QUARANTINE)")
             decision = "QUARANTINE"
             triggered_rules.append("GUARDRAIL_PRIOR_QUARANTINE")
             reason_codes.append("PRIOR_QUARANTINE_HISTORY")
-            guardrail_notes.append("Escalated due to prior quarantine history")
 
         # Anomaly guardrail (lower = more anomalous)
         if anomaly_score < anomaly_threshold and decision == "ALLOW":
+            guardrail_applied = True
+            decision_drivers.insert(0, f"GUARDRAIL: Anomaly detected (anomaly_score {anomaly_score:.1f} < threshold {anomaly_threshold}, escalated ALLOW → REVIEW)")
             decision = "REVIEW"
             triggered_rules.append("GUARDRAIL_ANOMALY_ESCALATION")
             reason_codes.append("ANOMALY_HIGH_RISK")
-            guardrail_notes.append("Escalated ALLOW -> REVIEW due to anomaly")
 
         # Synthetic guardrail (higher = more synthetic)
         if synthetic_likelihood >= synthetic_threshold and decision in ("ALLOW", "REVIEW"):
+            guardrail_applied = True
+            decision_drivers.insert(0, f"GUARDRAIL: Synthetic content likely (synthetic_likelihood {synthetic_likelihood:.1f} ≥ threshold {synthetic_threshold}, escalated {decision} → QUARANTINE)")
             decision = "QUARANTINE"
             triggered_rules.append("GUARDRAIL_SYNTHETIC_ESCALATION")
             reason_codes.append("SYNTHETIC_LIKELY_FIRST_SEEN")
-            guardrail_notes.append("Escalated due to synthetic likelihood")
 
         # Extreme risk guardrails
         if risk_score >= risk_threshold_reject and decision != "REJECT":
+            guardrail_applied = True
+            decision_drivers.insert(0, f"GUARDRAIL: Extreme risk (risk_score {risk_score:.1f} ≥ reject threshold {risk_threshold_reject}, escalated {decision} → REJECT)")
             decision = "REJECT"
             triggered_rules.append("GUARDRAIL_RISK_REJECT")
             reason_codes.append("RISK_SCORE_HIGH")
-            guardrail_notes.append("Escalated to REJECT due to extreme risk")
         elif risk_score >= risk_threshold_quarantine and decision in ("ALLOW", "REVIEW"):
+            guardrail_applied = True
+            decision_drivers.insert(0, f"GUARDRAIL: High risk (risk_score {risk_score:.1f} ≥ quarantine threshold {risk_threshold_quarantine}, escalated {decision} → QUARANTINE)")
             decision = "QUARANTINE"
             triggered_rules.append("GUARDRAIL_RISK_QUARANTINE")
             reason_codes.append("RISK_SCORE_HIGH")
-            guardrail_notes.append("Escalated to QUARANTINE due to high risk")
 
         # Assurance-based allow (only if still REVIEW and low risk)
         if decision == "REVIEW" and assurance_score >= assurance_threshold_allow and risk_score < risk_threshold_review:
+            guardrail_applied = True
+            decision_drivers.append(f"GUARDRAIL: High assurance (assurance_score {assurance_score:.1f} ≥ threshold {assurance_threshold_allow}, escalated REVIEW → ALLOW)")
             decision = "ALLOW"
             triggered_rules.append("ASSURANCE_THRESHOLD_ALLOW")
             reason_codes.append("HIGH_ASSURANCE")
-            guardrail_notes.append("Assurance high, allowing despite review baseline")
 
-        rationale_tail = ""
-        if guardrail_notes:
-            rationale_tail = " Guardrails applied: " + "; ".join(guardrail_notes)
+        # Build final rationale with structure
+        # 1. Decision mode and thresholds used
+        mode_desc = decision_mode.value.replace("_", " ").title()
+        rationale_parts = [
+            f"Decision: {decision} (mode: {mode_desc})",
+            f"Thresholds: review={risk_threshold_review}, quarantine={risk_threshold_quarantine}, reject={risk_threshold_reject}, "
+            f"assurance_allow={assurance_threshold_allow}, anomaly={anomaly_threshold}, synthetic={synthetic_threshold}",
+        ]
+        
+        # 2. Primary drivers (top 3)
+        if decision_drivers:
+            top_drivers = decision_drivers[:3]
+            rationale_parts.append(f"Primary drivers: {'; '.join(top_drivers)}")
+        
+        # 3. Counterfactual (if available)
+        if counterfactual:
+            rationale_parts.append(f"Counterfactual: {counterfactual}")
+        
+        # 4. Guardrail note (if applied)
+        if guardrail_applied and original_decision != decision:
+            rationale_parts.append(f"Note: Guardrails modified decision from {original_decision} to {decision}")
 
-        final_rationale = (
-            f"{'label_first' if decision_mode == 'label_first' and primary_label else 'score_first'} baseline. "
-            + " ".join(rationale_parts)
-            + rationale_tail
-        )
+        final_rationale = ". ".join(rationale_parts) + "."
 
         decision_payload = {
             "decision": decision,

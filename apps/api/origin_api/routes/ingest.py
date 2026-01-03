@@ -214,6 +214,8 @@ async def ingest(
         "has_prior_reject": pvid_result["sightings"]["has_prior_reject"],
         "primary_label": primary_label,
         "class_probabilities": class_probabilities,
+        # Include model metadata for provenance (B)
+        "model_metadata": risk_signals.get("model_metadata", {}),
     }
 
     # Create upload record
@@ -264,6 +266,9 @@ async def ingest(
 
     # Prepare outputs for certificate and ledger
     # These fields are used by EvidencePackV2 to support AI-Act/DSA-aligned evidence generation
+    # Extract model metadata for provenance (B)
+    model_metadata = ml_signals.get("model_metadata", {})
+    
     outputs = {
         "decision": decision_result["decision"],
         "risk_score": risk_signals["risk_score"],
@@ -284,6 +289,15 @@ async def ingest(
             if policy_profile and policy_profile.thresholds_json
             else None
         ),
+        # Provenance fields (B) - immutable model/policy metadata for auditability
+        "model_provenance": {
+            "risk_model_artifact_sha256": model_metadata.get("risk_model_artifact_sha256"),
+            "anomaly_model_artifact_sha256": model_metadata.get("anomaly_model_artifact_sha256"),
+            "risk_model_version": model_metadata.get("risk_model_version"),
+            "anomaly_model_version": model_metadata.get("anomaly_model_version"),
+            "git_commit_sha": model_metadata.get("git_commit_sha"),
+            "feature_schema_version": model_metadata.get("feature_schema_version"),
+        },
         # Evidence pack metadata (will be populated after canonical snapshot is created)
         "evidence_version": "origin-evidence-v2",
         # evidence_hash will be added after evidence pack generation

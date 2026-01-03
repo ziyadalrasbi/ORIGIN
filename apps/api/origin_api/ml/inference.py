@@ -7,16 +7,21 @@ Returns model-driven risk signals plus explainability metadata:
 - synthetic_likelihood: heuristic 0-100 likelihood of synthetic/AI
 - primary_label: highest-probability class from the risk model
 - class_probabilities: mapping of label -> probability
+- model_metadata: provenance information (model hashes, versions, git commit, feature schema)
 """
 
+import hashlib
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
 import joblib
 import numpy as np
 import pandas as pd
+
+from origin_api.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +35,13 @@ class MLInferenceService:
         self.risk_model = None
         self.risk_label_encoder = None
         self.anomaly_model = None
+        self.settings = get_settings()
         self._load_models()
+        
+        # Compute model artifact hashes for provenance
+        self.risk_model_hash: Optional[str] = None
+        self.anomaly_model_hash: Optional[str] = None
+        self._compute_model_hashes()
 
     def _load_models(self):
         """Load trained models."""
@@ -65,6 +76,27 @@ class MLInferenceService:
                 self.anomaly_model = None
         else:
             logger.warning("Anomaly model not found. Using fallback heuristics.")
+    
+    def _compute_model_hashes(self):
+        """Compute SHA256 hashes of model artifacts for provenance."""
+        risk_model_path = self.model_dir / "risk_model.pkl"
+        anomaly_model_path = self.model_dir / "anomaly_model.pkl"
+        
+        if risk_model_path.exists():
+            try:
+                with open(risk_model_path, "rb") as f:
+                    risk_model_bytes = f.read()
+                    self.risk_model_hash = hashlib.sha256(risk_model_bytes).hexdigest()
+            except Exception as e:
+                logger.warning(f"Failed to compute risk model hash: {e}")
+        
+        if anomaly_model_path.exists():
+            try:
+                with open(anomaly_model_path, "rb") as f:
+                    anomaly_model_bytes = f.read()
+                    self.anomaly_model_hash = hashlib.sha256(anomaly_model_bytes).hexdigest()
+            except Exception as e:
+                logger.warning(f"Failed to compute anomaly model hash: {e}")
 
     def compute_risk_signals(
         self,
@@ -233,6 +265,16 @@ class MLInferenceService:
             identity_confidence, upload_velocity, prior_sightings_count
         )
 
+        # Build model metadata for provenance
+        model_metadata = {
+            "risk_model_artifact_sha256": self.risk_model_hash,
+            "anomaly_model_artifact_sha256": self.anomaly_model_hash,
+            "risk_model_version": self.settings.risk_model_version or "unknown",
+            "anomaly_model_version": self.settings.anomaly_model_version or "unknown",
+            "git_commit_sha": self.settings.git_commit_sha or os.getenv("GIT_COMMIT_SHA") or "unknown",
+            "feature_schema_version": self.settings.feature_schema_version,
+        }
+
         return {
             "risk_score": float(risk_score),
             "assurance_score": float(assurance_score),
@@ -240,6 +282,7 @@ class MLInferenceService:
             "synthetic_likelihood": float(synthetic_likelihood),
             "primary_label": primary_label,
             "class_probabilities": class_probabilities,
+            "model_metadata": model_metadata,
         }
 
     def _fallback_risk_score(
