@@ -84,9 +84,16 @@ def _get_idempotency_key(tenant_id: int, certificate_id: int, audience: str, for
 
 
 def _get_deterministic_task_id(certificate_id: int, tenant_id: int, audience: str, formats: list[str]) -> str:
-    """Generate deterministic task ID for Celery task (includes audience and formats for uniqueness)."""
-    sorted_formats = ",".join(sorted(formats))
-    return f"evidence_pack_{certificate_id}_{tenant_id}_{audience}_{sorted_formats}"
+    """
+    Generate deterministic task ID for Celery task using hash-based approach.
+    
+    Uses SHA256 hash of idempotency key to ensure safe length and character set.
+    """
+    import hashlib
+    
+    idempotency_key = _get_idempotency_key(tenant_id, certificate_id, audience, formats)
+    hash_digest = hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]
+    return f"evidence_pack_{hash_digest}"
 
 
 def _upsert_evidence_pack(
@@ -302,6 +309,7 @@ async def request_evidence_pack(
                             "task_id": evidence_pack.task_id,
                         },
                     )
+                    # task_status should mirror task_state (not task_id)
                     response_data = {
                         "status": "pending",
                         "certificate_id": request_data.certificate_id,
@@ -310,8 +318,8 @@ async def request_evidence_pack(
                         "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
                         "retry_after_seconds": 30,
                         "task_id": evidence_pack.task_id,
-                        "task_status": None,
-                        "task_state": evidence_pack.task_id if evidence_pack.task_id else None,  # Backward compatibility
+                        "task_status": None,  # Celery unavailable, status unknown
+                        "task_state": None,  # Backward compatibility: mirrors task_status
                     }
                     return JSONResponse(
                         status_code=status.HTTP_202_ACCEPTED,
@@ -409,14 +417,21 @@ async def request_evidence_pack(
             evidence_pack.updated_at = now
             db.commit()
             
-            return EvidencePackResponse(
-                status="pending",
-                certificate_id=request_data.certificate_id,
-                audience=determined_audience,
-                formats=formats,
-                poll_url=f"/v1/evidence-packs/{request_data.certificate_id}",
-                retry_after_seconds=30,
-                task_state=task_state,
+            response_data = {
+                "status": "pending",
+                "certificate_id": request_data.certificate_id,
+                "audience": determined_audience,
+                "formats": formats,
+                "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
+                "retry_after_seconds": 30,
+                "task_id": evidence_pack.task_id,
+                "task_status": task_state,  # Celery state: PENDING/STARTED/RETRY
+                "task_state": task_state,  # Backward compatibility: mirrors task_status
+            }
+            return JSONResponse(
+                status_code=status.HTTP_202_ACCEPTED,
+                content=response_data,
+                headers={"Retry-After": "30"},
             )
     
     # Enqueue new task
@@ -445,14 +460,10 @@ async def request_evidence_pack(
                 "task_id": task_id,
             },
         )
-    except (ImportError, ConnectionError) as e:
-        # Celery or broker not available - return 503 Service Unavailable
-        error_code = "CELERY_UNAVAILABLE"
-        if isinstance(e, ConnectionError):
-            error_code = "BROKER_UNAVAILABLE"
-        
+    except (ConnectionError, TimeoutError) as e:
+        # Broker connectivity failures - return 503
         logger.error(
-            f"Celery/broker unavailable, cannot enqueue evidence pack task: {e}",
+            f"Broker connectivity failure, cannot enqueue evidence pack task: {e}",
             extra={
                 "correlation_id": correlation_id,
                 "certificate_id": certificate.certificate_id,
@@ -464,8 +475,8 @@ async def request_evidence_pack(
         )
         # Update status to failed
         evidence_pack.status = "failed"
-        evidence_pack.error_code = error_code
-        evidence_pack.error_message = "Evidence pack generation service unavailable (Celery/worker/broker not configured)"
+        evidence_pack.error_code = "BROKER_UNAVAILABLE"
+        evidence_pack.error_message = "Broker unavailable (connection/timeout error)"
         evidence_pack.updated_at = now
         db.commit()
         
@@ -476,10 +487,56 @@ async def request_evidence_pack(
                 "certificate_id": request_data.certificate_id,
                 "audience": determined_audience,
                 "formats": formats,
-                "error_code": error_code,
-                "error_message": "Evidence pack generation service unavailable (Celery/worker/broker not configured)",
+                "error_code": "BROKER_UNAVAILABLE",
+                "error_message": "Broker unavailable (connection/timeout error)",
             },
+            headers={"Retry-After": "30"},
         )
+    except Exception as broker_error:
+        # Check if it's a kombu/broker error
+        error_type = type(broker_error).__name__
+        is_broker_error = (
+            "OperationalError" in error_type or
+            "KombuError" in error_type or
+            "BrokerConnection" in error_type or
+            "Connection" in error_type
+        )
+        
+        if is_broker_error:
+            # Broker-related error - return 503
+            logger.error(
+                f"Broker error enqueueing evidence pack task: {broker_error}",
+                extra={
+                    "correlation_id": correlation_id,
+                    "certificate_id": certificate.certificate_id,
+                    "tenant_id": tenant.id,
+                    "audience": determined_audience,
+                    "formats": formats,
+                    "error_type": error_type,
+                },
+                exc_info=True,
+            )
+            evidence_pack.status = "failed"
+            evidence_pack.error_code = "BROKER_UNAVAILABLE"
+            evidence_pack.error_message = f"Broker error: {str(broker_error)[:200]}"
+            evidence_pack.updated_at = now
+            db.commit()
+            
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={
+                    "status": "failed",
+                    "certificate_id": request_data.certificate_id,
+                    "audience": determined_audience,
+                    "formats": formats,
+                    "error_code": "BROKER_UNAVAILABLE",
+                    "error_message": f"Broker error: {str(broker_error)[:200]}",
+                },
+                headers={"Retry-After": "30"},
+            )
+        
+        # Re-raise if not a broker error (will be caught by outer exception handler)
+        raise
     except Exception as e:
         # Other errors (broker misconfigured, kombu errors, etc.) - return 503
         logger.error(
@@ -510,16 +567,25 @@ async def request_evidence_pack(
                 "error_code": "TASK_ENQUEUE_FAILED",
                 "error_message": f"Failed to enqueue generation task: {str(e)[:200]}",
             },
+            headers={"Retry-After": "30"},
         )
     
-    return EvidencePackResponse(
-        status="pending",
-        certificate_id=request_data.certificate_id,
-        audience=determined_audience,
-        formats=formats,
-        poll_url=f"/v1/evidence-packs/{request_data.certificate_id}",
-        retry_after_seconds=30,
-        task_state="PENDING",
+    # Task successfully enqueued
+    response_data = {
+        "status": "pending",
+        "certificate_id": request_data.certificate_id,
+        "audience": determined_audience,
+        "formats": formats,
+        "poll_url": f"/v1/evidence-packs/{request_data.certificate_id}",
+        "retry_after_seconds": 30,
+        "task_id": task_id,
+        "task_status": "PENDING",
+        "task_state": "PENDING",  # Backward compatibility: mirrors task_status
+    }
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content=response_data,
+        headers={"Retry-After": "30"},
     )
 
 
