@@ -30,10 +30,16 @@ class StorageService:
                 secret_key=settings.minio_secret_key,
                 secure=settings.minio_use_ssl,
             )
-            # Ensure bucket exists
-            if not self.client.bucket_exists(self.bucket):
-                self.client.make_bucket(self.bucket)
-                logger.info(f"Created bucket: {self.bucket}")
+            # Only auto-create bucket in development
+            # In production, bucket should be provisioned via infrastructure
+            if settings.is_development:
+                if not self.client.bucket_exists(self.bucket):
+                    self.client.make_bucket(self.bucket)
+                    logger.info(f"Created bucket: {self.bucket} (development mode)")
+            else:
+                # In production, verify bucket exists but don't create
+                if not self.client.bucket_exists(self.bucket):
+                    logger.warning(f"Bucket {self.bucket} does not exist. Please provision via infrastructure.")
         except Exception as e:
             logger.error(f"Failed to initialize MinIO client: {e}")
             self.client = None

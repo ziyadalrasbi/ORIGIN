@@ -71,54 +71,11 @@ def generate_evidence_pack(
         dict with status and storage_refs
     """
     try:
-        # Import here to avoid circular dependencies
-        # The volume mount is ./apps/api:/app/api, so origin_api is at /app/api/origin_api
-        import sys
-        import os
-        
-        # Add /app/api to path (where origin_api package is located)
-        api_path = "/app/api"
-        if api_path not in sys.path:
-            sys.path.insert(0, api_path)
-            logger.debug(f"Added {api_path} to Python path")
-        
-        # Verify origin_api directory exists
-        origin_api_path = os.path.join(api_path, "origin_api")
-        if not os.path.exists(origin_api_path):
-            logger.error(f"origin_api not found at {origin_api_path}")
-            logger.error(f"Files in /app/api: {os.listdir(api_path) if os.path.exists(api_path) else 'N/A'}")
-            raise ImportError(f"origin_api directory not found at {origin_api_path}")
-        
-        # Try importing step by step for better error messages
-        try:
-            # Import origin_api package first to initialize it
-            import origin_api
-            logger.debug(f"Successfully imported origin_api package from {origin_api.__file__ if hasattr(origin_api, '__file__') else 'unknown'}")
-        except ImportError as import_err:
-            logger.error(f"Failed to import origin_api: {import_err}")
-            logger.error(f"Python path: {sys.path}")
-            logger.error(f"Current working directory: {os.getcwd()}")
-            logger.error(f"Files in /app/api: {os.listdir(api_path) if os.path.exists(api_path) else 'N/A'}")
-            raise
-        
-        try:
-            # Now import the models submodule
-            from origin_api.models import DecisionCertificate, EvidencePack, Upload
-            logger.debug("Successfully imported origin_api.models")
-        except ImportError as import_err:
-            logger.error(f"Failed to import origin_api.models: {import_err}")
-            models_path = os.path.join(origin_api_path, "models")
-            logger.error(f"models directory exists: {os.path.exists(models_path)}")
-            if os.path.exists(models_path):
-                logger.error(f"Files in models: {os.listdir(models_path)}")
-            raise
-        
-        try:
-            from origin_api.evidence.generator import EvidencePackGenerator
-            logger.debug("Successfully imported EvidencePackGenerator")
-        except ImportError as import_err:
-            logger.error(f"Failed to import EvidencePackGenerator: {import_err}")
-            raise
+        # Import origin_api modules (available via PYTHONPATH or volume mount)
+        # No sys.path manipulation needed - PYTHONPATH is set in Dockerfile/docker-compose
+        from origin_api.models import DecisionCertificate, EvidencePack, Upload
+        from origin_api.evidence.generator import EvidencePackGenerator
+        logger.debug("Successfully imported origin_api modules")
         
         db = self.db
         
@@ -142,12 +99,13 @@ def generate_evidence_pack(
             logger.error(f"Upload not found for certificate {certificate_id}")
             raise ValueError(f"Upload not found for certificate {certificate_id}")
         
-        # Check if evidence pack already exists and is ready with same formats
+        # Check if evidence pack already exists and is ready with same formats and audience
         evidence_pack = (
             db.query(EvidencePack)
             .filter(
                 EvidencePack.tenant_id == tenant_id,
                 EvidencePack.certificate_id == certificate.id,
+                EvidencePack.audience == audience,
             )
             .first()
         )
@@ -156,7 +114,7 @@ def generate_evidence_pack(
             # Check if formats match
             existing_formats = evidence_pack.formats or []
             if set(formats) <= set(existing_formats):
-                logger.info(f"Evidence pack already ready with requested formats: {formats}")
+                logger.info(f"Evidence pack already ready with requested formats: {formats} for audience: {audience}")
                 return {
                     "status": "ready",
                     "certificate_id": certificate_id,
@@ -174,19 +132,34 @@ def generate_evidence_pack(
                 {"id": evidence_pack_id}
             )
         else:
-            # Create evidence pack record using raw SQL
+            # Create evidence pack record using raw SQL (with audience)
             import json
             formats_json = json.dumps(formats) if formats else None
-            result = db.execute(
-                text("INSERT INTO evidence_packs (tenant_id, certificate_id, status, formats, created_at) "
-                     "VALUES (:tenant_id, :certificate_id, 'processing', CAST(:formats AS jsonb), NOW()) "
-                     "RETURNING id"),
-                {
-                    "tenant_id": tenant_id,
-                    "certificate_id": certificate.id,
-                    "formats": formats_json,
-                }
-            )
+            # Check if audience column exists
+            try:
+                result = db.execute(
+                    text("INSERT INTO evidence_packs (tenant_id, certificate_id, audience, status, formats, created_at) "
+                         "VALUES (:tenant_id, :certificate_id, :audience, 'processing', CAST(:formats AS jsonb), NOW()) "
+                         "RETURNING id"),
+                    {
+                        "tenant_id": tenant_id,
+                        "certificate_id": certificate.id,
+                        "audience": audience,
+                        "formats": formats_json,
+                    }
+                )
+            except Exception:
+                # Fallback if audience column doesn't exist yet
+                result = db.execute(
+                    text("INSERT INTO evidence_packs (tenant_id, certificate_id, status, formats, created_at) "
+                         "VALUES (:tenant_id, :certificate_id, 'processing', CAST(:formats AS jsonb), NOW()) "
+                         "RETURNING id"),
+                    {
+                        "tenant_id": tenant_id,
+                        "certificate_id": certificate.id,
+                        "formats": formats_json,
+                    }
+                )
             evidence_pack_id = result.scalar()
         db.commit()
         
@@ -221,17 +194,33 @@ def generate_evidence_pack(
         storage_refs_json = json.dumps(storage_refs) if storage_refs else None
         formats_json = json.dumps(formats) if formats else None
         
-        db.execute(
-            text("UPDATE evidence_packs SET status = 'ready', storage_refs = CAST(:storage_refs AS jsonb), "
-                 "formats = CAST(:formats AS jsonb), ready_at = NOW() "
-                 "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
-            {
-                "storage_refs": storage_refs_json,
-                "formats": formats_json,
-                "tenant_id": tenant_id,
-                "certificate_id": certificate.id,
-            }
-        )
+        # Update evidence pack (include audience in WHERE clause if column exists)
+        try:
+            db.execute(
+                text("UPDATE evidence_packs SET status = 'ready', storage_refs = CAST(:storage_refs AS jsonb), "
+                     "formats = CAST(:formats AS jsonb), ready_at = NOW() "
+                     "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id AND audience = :audience"),
+                {
+                    "storage_refs": storage_refs_json,
+                    "formats": formats_json,
+                    "tenant_id": tenant_id,
+                    "certificate_id": certificate.id,
+                    "audience": audience,
+                }
+            )
+        except Exception:
+            # Fallback if audience column doesn't exist yet
+            db.execute(
+                text("UPDATE evidence_packs SET status = 'ready', storage_refs = CAST(:storage_refs AS jsonb), "
+                     "formats = CAST(:formats AS jsonb), ready_at = NOW() "
+                     "WHERE tenant_id = :tenant_id AND certificate_id = :certificate_id"),
+                {
+                    "storage_refs": storage_refs_json,
+                    "formats": formats_json,
+                    "tenant_id": tenant_id,
+                    "certificate_id": certificate.id,
+                }
+            )
         db.commit()
         
         logger.info(f"Successfully generated evidence pack for certificate {certificate_id}")

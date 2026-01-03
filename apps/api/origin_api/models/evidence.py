@@ -22,9 +22,10 @@ class EvidencePack(Base):
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
     certificate_id = Column(Integer, ForeignKey("decision_certificates.id"), nullable=False, index=True)
+    audience = Column(String(50), nullable=False, server_default="INTERNAL")  # INTERNAL, DSP, REGULATOR
     status = Column(String(50), default="pending", nullable=False, index=True)  # pending, processing, ready, failed
     formats = Column(JSON, nullable=True)  # ["json", "pdf", "html"]
-    storage_refs = Column(JSON, nullable=True)  # {"json": "s3://...", "pdf": "s3://...", "html": "s3://..."}
+    storage_refs = Column(JSON, nullable=True)  # {"json": "object_key", "pdf": "object_key", "html": "object_key"}
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     ready_at = Column(DateTime, nullable=True)
     
@@ -33,6 +34,15 @@ class EvidencePack(Base):
     evidence_hash = Column(String(64), nullable=True, index=True)  # SHA256 hash of canonical_json
     evidence_version = Column(String(50), nullable=True, server_default="origin-evidence-v2")  # Schema version
     canonical_created_at = Column(DateTime, nullable=True)  # When canonical snapshot was created
+    
+    # Error tracking
+    error_code = Column(String(100), nullable=True)  # Error code for failed generations
+    error_message = Column(Text, nullable=True)  # Sanitized error message
+    
+    __table_args__ = (
+        # Unique constraint ensures idempotency: one evidence pack per tenant/certificate/audience
+        {"sqlite_autoincrement": True},
+    )
 
     # Relationships
     tenant = relationship("Tenant")

@@ -2266,8 +2266,17 @@ class EvidencePackGenerator:
         storage_service = get_storage_service()
         storage_refs = {}
         
-        # Try object storage first, fallback to filesystem if unavailable
-        use_object_storage = storage_service.client is not None
+        # Determine storage mode
+        # In production, must use object storage (no filesystem fallback)
+        storage_mode = settings.storage_mode
+        use_object_storage = (
+            storage_mode == "object" and storage_service.client is not None
+        )
+        
+        if storage_mode == "object" and not storage_service.client:
+            raise ValueError(
+                "Object storage required in production mode but storage client unavailable"
+            )
         
         for fmt in formats:
             try:

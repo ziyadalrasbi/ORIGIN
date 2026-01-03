@@ -48,6 +48,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # Set tenant in request state
             request.state.tenant = tenant
             request.state.tenant_id = tenant.id
+            
+            # Store API key for scope extraction (if available)
+            if hasattr(tenant, "_api_key_obj"):
+                request.state.api_key_obj = tenant._api_key_obj
 
         finally:
             db.close()

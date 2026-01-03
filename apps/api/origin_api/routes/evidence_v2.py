@@ -19,6 +19,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from origin_api.celery_client import get_celery_app
@@ -92,102 +93,61 @@ def _upsert_evidence_pack(
     Upsert evidence pack record with proper idempotency.
     
     Uses PostgreSQL INSERT ... ON CONFLICT to ensure atomicity.
-    Falls back to SELECT FOR UPDATE if unique constraint not yet applied.
     """
     formats_json = json.dumps(formats) if formats else None
-    now = datetime.now(timezone.utc)
     
-    # Try INSERT ... ON CONFLICT (requires unique constraint)
-    try:
-        stmt = (
-            insert(EvidencePack.__table__)
-            .values(
-                tenant_id=tenant_id,
-                certificate_id=certificate_id,
-                audience=audience,
-                status=status,
-                formats=formats_json,
-                created_at=now,
-                error_code=error_code,
-                error_message=error_message,
-            )
-            .on_conflict_do_update(
-                constraint="uq_evidence_packs_tenant_certificate_audience",
-                set_={
-                    "status": status,
-                    "formats": formats_json,
-                    "error_code": error_code,
-                    "error_message": error_message,
-                },
-            )
-            .returning(EvidencePack.__table__)
-        )
-        
-        result = db.execute(stmt)
-        db.commit()
-        
-        row = result.first()
-        if row:
-            # Create EvidencePack instance from row
-            evidence_pack = EvidencePack(
-                id=row.id,
-                tenant_id=row.tenant_id,
-                certificate_id=row.certificate_id,
-                audience=row.audience,
-                status=row.status,
-                formats=row.formats,
-                storage_refs=row.storage_refs,
-                created_at=row.created_at,
-                ready_at=row.ready_at,
-                canonical_json=getattr(row, "canonical_json", None),
-                evidence_hash=getattr(row, "evidence_hash", None),
-                evidence_version=getattr(row, "evidence_version", None),
-                canonical_created_at=getattr(row, "canonical_created_at", None),
-                error_code=getattr(row, "error_code", None),
-                error_message=getattr(row, "error_message", None),
-            )
-            return evidence_pack
-    except Exception as e:
-        # Fallback: SELECT FOR UPDATE (if unique constraint not applied yet)
-        logger.debug(f"INSERT ON CONFLICT failed, using SELECT FOR UPDATE fallback: {e}")
-        db.rollback()
-    
-    # Fallback: SELECT FOR UPDATE with manual upsert
-    evidence_pack = (
-        db.query(EvidencePack)
-        .filter(
-            EvidencePack.tenant_id == tenant_id,
-            EvidencePack.certificate_id == certificate_id,
-            EvidencePack.audience == audience,
-        )
-        .with_for_update()
-        .first()
-    )
-    
-    if evidence_pack:
-        # Update existing
-        evidence_pack.status = status
-        evidence_pack.formats = formats_json
-        evidence_pack.error_code = error_code
-        evidence_pack.error_message = error_message
-        db.commit()
-        return evidence_pack
-    else:
-        # Create new
-        evidence_pack = EvidencePack(
+    # Use INSERT ... ON CONFLICT for atomic upsert
+    stmt = (
+        insert(EvidencePack.__table__)
+        .values(
             tenant_id=tenant_id,
             certificate_id=certificate_id,
             audience=audience,
             status=status,
             formats=formats_json,
-            created_at=now,
+            created_at=datetime.now(timezone.utc),
             error_code=error_code,
             error_message=error_message,
         )
-        db.add(evidence_pack)
-        db.commit()
-        db.refresh(evidence_pack)
-        return evidence_pack
+        .on_conflict_do_update(
+            index_elements=["tenant_id", "certificate_id", "audience"],
+            set_={
+                "status": status,
+                "formats": formats_json,
+                "error_code": error_code,
+                "error_message": error_message,
+            },
+        )
+        .returning(EvidencePack.__table__)
+    )
+    
+    result = db.execute(stmt)
+    db.commit()
+    
+    row = result.first()
+    if not row:
+        raise ValueError("Failed to upsert evidence pack")
+    
+    # Create EvidencePack instance from row
+    evidence_pack = EvidencePack(
+        id=row.id,
+        tenant_id=row.tenant_id,
+        certificate_id=row.certificate_id,
+        audience=row.audience,
+        status=row.status,
+        formats=row.formats,
+        storage_refs=row.storage_refs,
+        created_at=row.created_at,
+        ready_at=row.ready_at,
+        canonical_json=row.canonical_json,
+        evidence_hash=row.evidence_hash,
+        evidence_version=row.evidence_version,
+        canonical_created_at=row.canonical_created_at,
+        error_code=row.error_code,
+        error_message=row.error_message,
+    )
+    
+    return evidence_pack
 
 
 @router.post("/evidence-packs", response_model=EvidencePackResponse, status_code=status.HTTP_202_ACCEPTED)

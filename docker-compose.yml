@@ -89,9 +89,10 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
       SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      PYTHONPATH: /app/apps/api:${PYTHONPATH}
     volumes:
       - ./apps/worker:/app
-      - ./apps/api:/app/api  # Mount entire apps/api so origin_api package structure is preserved
+      - ./apps/api:/app/apps/api  # Mount origin_api package so worker can import it cleanly
       - ./infra:/app/infra
       - ./ml:/app/ml
     depends_on:

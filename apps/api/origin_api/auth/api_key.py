@@ -38,7 +38,7 @@ def verify_api_key(api_key: str, hashed: str) -> bool:
 def get_tenant_by_api_key(db: Session, api_key: str) -> Optional[Tenant]:
     """Get tenant by API key."""
     # Find active API key
-    api_key_obj = (
+    api_key_objs = (
         db.query(APIKey)
         .filter(
             APIKey.is_active == True,  # noqa: E712
@@ -48,9 +48,13 @@ def get_tenant_by_api_key(db: Session, api_key: str) -> Optional[Tenant]:
     )
 
     # Check each API key hash
-    for key_obj in api_key_obj:
+    for key_obj in api_key_objs:
         if verify_api_key(api_key, key_obj.hash):
-            return db.query(Tenant).filter(Tenant.id == key_obj.tenant_id).first()
+            tenant = db.query(Tenant).filter(Tenant.id == key_obj.tenant_id).first()
+            if tenant:
+                # Store API key object in tenant for scope access (hack via attribute)
+                tenant._api_key_obj = key_obj  # Store for scope extraction
+            return tenant
 
     # Fallback: check tenant's api_key_hash (legacy)
     tenants = db.query(Tenant).filter(Tenant.status == "active").all()

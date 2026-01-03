@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     cors_allow_credentials: bool = True
     cors_allow_methods: list[str] = ["*"]
     cors_allow_headers: list[str] = ["*"]
+    
+    # Storage
+    storage_mode: str = "object"  # "object" or "filesystem"
+    evidence_pack_timeout_minutes: int = 5  # Timeout for async evidence pack generation
 
     @property
     def database_url_computed(self) -> str:
